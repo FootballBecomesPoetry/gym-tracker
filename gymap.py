@@ -1,15 +1,17 @@
 import streamlit as st
+import streamlit.components.v1 as components
 import psycopg2
 import pandas as pd
+import base64
 from datetime import date, timedelta
 
 # ---------------------------------------------------------------
-# CONFIG - your plan, baked in
+# CONFIG
 # ---------------------------------------------------------------
-TARGETS = {
+DEFAULT_TARGETS = {
     "calories_min": 2200, "calories_max": 2500,
     "protein_min": 180, "protein_max": 220,
-    "water_min": 3.0, "water_max": 4.0,   # litres
+    "water_min": 3.0, "water_max": 4.0,
     "steps_min": 10000, "steps_max": 15000,
 }
 
@@ -43,6 +45,357 @@ GYM_SPLIT = {
 }
 
 WEEKDAY_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+LANGUAGES = ["English", "Afrikaans", "Spanish", "French", "Italian", "Dutch", "Urdu", "Arabic", "German"]
+
+GOALS = ["Lose weight", "Gain muscle", "Maintain", "Body recomposition"]
+ACTIVITY_LEVELS = [
+    "Sedentary (little exercise)", "Light (1-3 days/week)", "Moderate (3-5 days/week)",
+    "Active (6-7 days/week)", "Very active (physical job + training)"
+]
+ACTIVITY_MULTIPLIERS = {
+    "Sedentary (little exercise)": 1.2, "Light (1-3 days/week)": 1.375,
+    "Moderate (3-5 days/week)": 1.55, "Active (6-7 days/week)": 1.725,
+    "Very active (physical job + training)": 1.9,
+}
+SEX_OPTIONS = ["Male", "Female", "Prefer not to say"]
+
+# ---------------------------------------------------------------
+# TRANSLATIONS (UI chrome only — your own data/notes stay as typed)
+# ---------------------------------------------------------------
+BASE_EN = {
+    "app_title": "⚡ Momentum", "nav_today": "Today", "nav_weight_log": "Weight Log",
+    "nav_weekly_dashboard": "Weekly Dashboard", "nav_measurements": "Measurements",
+    "nav_photos": "Progress Photos", "nav_settings": "Settings", "nav_profile": "Profile",
+    "gym_label": "Gym", "meals_header": "🍽️ Meals", "workout_header": "🏋️ Workout",
+    "daily_numbers_header": "📊 Daily Numbers", "weight_section_header": "⚖️ Weight",
+    "notes_label": "Notes (optional)", "save_button": "💾 Save today's log", "saved_msg": "Saved!",
+    "prev_day": "⬅ Prev day", "next_day": "Next day ➡", "done_label": "Done",
+    "what_did_you_have": "What did you have?", "calories_label": "Calories", "protein_label": "Protein (g)",
+    "use_meal_total": "Use meal total", "water_label": "Water (L)", "steps_label": "Steps",
+    "weight_label": "Weight (kg)", "weight_trend_header": "⚖️ Weight Trend",
+    "no_weight_entries": "No weight entries yet. Log your weight on the Today page.",
+    "latest_weight": "Latest weight", "change_period": "Change (period)", "entries_logged": "Entries logged",
+    "weekly_adherence_header": "📅 Weekly Adherence", "meals_hit_avg": "Meals hit (avg)",
+    "workouts_completed": "Workouts completed", "protein_target_days": "Protein target days",
+    "steps_target_days": "Steps target days", "measurements_header": "📏 Body Measurements",
+    "waist_label": "Waist (cm)", "chest_label": "Chest (cm)", "hips_label": "Hips (cm)",
+    "arms_label": "Arms (cm)", "thighs_label": "Thighs (cm)", "save_measurement": "Save measurement",
+    "photos_header": "📸 Progress Photos", "upload_photo": "Upload a photo",
+    "caption_label": "Caption (optional)", "save_photo": "Save photo",
+    "settings_header": "⚙️ Settings", "edit_targets_header": "Edit your targets",
+    "save_targets": "Save targets", "language_label": "Language",
+    "streak_header": "🔥 Streak & Badges", "current_streak_label": "Current streak",
+    "longest_streak_label": "Longest streak", "days_logged_label": "Days logged",
+    "badges_label": "Badges earned", "compare_header": "Compare two photos", "delete_label": "Delete",
+    "profile_header": "🙋 Your Profile", "goal_label": "Goal", "height_label": "Height (cm)",
+    "current_weight_label": "Current Weight (kg)", "age_label": "Age",
+    "sex_label": "Biological sex (for calorie calculation accuracy)", "country_label": "Country",
+    "activity_label": "Activity level", "recalc_button": "Save & recalculate my targets",
+    "targets_updated_msg": "Targets updated based on your profile!",
+    "profile_disclaimer": "These are estimates from standard formulas, not medical advice. Adjust freely in Settings.",
+    "bottle_0": "Let's get started 💪", "bottle_25": "Nice, warming up! 🔥",
+    "bottle_50": "Halfway there, keep going! 💦", "bottle_75": "Almost full — don't stop now! ⚡",
+    "bottle_100": "🎉 Bottle full! Workout complete!",
+    "extra_exercises_header": "➕ Extra (not in today's plan)",
+    "add_extra_placeholder": "e.g. Extra push-ups, evening run...",
+    "add_extra_button": "Add",
+}
+
+BASE_AF = {
+    "nav_today": "Vandag", "nav_weight_log": "Gewigslog", "nav_weekly_dashboard": "Weeklikse Oorsig",
+    "nav_measurements": "Afmetings", "nav_photos": "Vorderingsfoto's", "nav_settings": "Instellings",
+    "nav_profile": "Profiel", "gym_label": "Gimnasium", "meals_header": "🍽️ Maaltye",
+    "workout_header": "🏋️ Oefening", "daily_numbers_header": "📊 Daaglikse Syfers",
+    "weight_section_header": "⚖️ Gewig", "notes_label": "Notas (opsioneel)",
+    "save_button": "💾 Stoor vandag se log", "saved_msg": "Gestoor!", "prev_day": "⬅ Vorige dag",
+    "next_day": "Volgende dag ➡", "done_label": "Klaar", "what_did_you_have": "Wat het jy geëet?",
+    "calories_label": "Kalorieë", "protein_label": "Proteïen (g)", "use_meal_total": "Gebruik maaltyd totaal",
+    "water_label": "Water (L)", "steps_label": "Stappe", "weight_label": "Gewig (kg)",
+    "weight_trend_header": "⚖️ Gewigstendens",
+    "no_weight_entries": "Nog geen gewig aangeteken nie. Teken jou gewig op die Vandag-bladsy aan.",
+    "latest_weight": "Jongste gewig", "change_period": "Verandering (periode)", "entries_logged": "Inskrywings",
+    "weekly_adherence_header": "📅 Weeklikse Nakoming", "meals_hit_avg": "Maaltye behaal (gem.)",
+    "workouts_completed": "Oefeninge voltooi", "protein_target_days": "Proteïen-teiken dae",
+    "steps_target_days": "Stappe-teiken dae", "measurements_header": "📏 Liggaamsafmetings",
+    "waist_label": "Middel (cm)", "chest_label": "Bors (cm)", "hips_label": "Heupe (cm)",
+    "arms_label": "Arms (cm)", "thighs_label": "Boude (cm)", "save_measurement": "Stoor afmeting",
+    "photos_header": "📸 Vorderingsfoto's", "upload_photo": "Laai 'n foto op",
+    "caption_label": "Byskrif (opsioneel)", "save_photo": "Stoor foto",
+    "settings_header": "⚙️ Instellings", "edit_targets_header": "Wysig jou teikens",
+    "save_targets": "Stoor teikens", "language_label": "Taal",
+    "streak_header": "🔥 Reeks & Kentekens", "current_streak_label": "Huidige reeks",
+    "longest_streak_label": "Langste reeks", "days_logged_label": "Dae aangeteken",
+    "badges_label": "Kentekens verdien", "compare_header": "Vergelyk twee foto's", "delete_label": "Verwyder",
+    "profile_header": "🙋 Jou Profiel", "goal_label": "Doel", "height_label": "Lengte (cm)",
+    "current_weight_label": "Huidige Gewig (kg)", "age_label": "Ouderdom",
+    "sex_label": "Biologiese geslag (vir akkurate berekening)", "country_label": "Land",
+    "activity_label": "Aktiwiteitsvlak", "recalc_button": "Stoor & herbereken my teikens",
+    "targets_updated_msg": "Teikens opgedateer op grond van jou profiel!",
+    "profile_disclaimer": "Dit is skattings van standaardformules, nie mediese advies nie. Pas gerus aan by Instellings.",
+    "bottle_0": "Kom ons begin 💪", "bottle_25": "Mooi, warm op! 🔥",
+    "bottle_50": "Op pad, hou aan! 💦", "bottle_75": "Amper vol — moenie nou ophou nie! ⚡",
+    "bottle_100": "🎉 Bottel vol! Oefening voltooi!",
+}
+
+BASE_ES = {
+    "nav_today": "Hoy", "nav_weight_log": "Registro de Peso", "nav_weekly_dashboard": "Panel Semanal",
+    "nav_measurements": "Medidas", "nav_photos": "Fotos de Progreso", "nav_settings": "Configuración",
+    "nav_profile": "Perfil", "gym_label": "Gimnasio", "meals_header": "🍽️ Comidas",
+    "workout_header": "🏋️ Entrenamiento", "daily_numbers_header": "📊 Datos Diarios",
+    "weight_section_header": "⚖️ Peso", "notes_label": "Notas (opcional)",
+    "save_button": "💾 Guardar registro de hoy", "saved_msg": "¡Guardado!", "prev_day": "⬅ Día anterior",
+    "next_day": "Día siguiente ➡", "done_label": "Hecho", "what_did_you_have": "¿Qué comiste?",
+    "calories_label": "Calorías", "protein_label": "Proteína (g)", "use_meal_total": "Usar total de comidas",
+    "water_label": "Agua (L)", "steps_label": "Pasos", "weight_label": "Peso (kg)",
+    "weight_trend_header": "⚖️ Tendencia de Peso",
+    "no_weight_entries": "Aún no hay registros de peso. Registra tu peso en la página de Hoy.",
+    "latest_weight": "Peso más reciente", "change_period": "Cambio (período)", "entries_logged": "Registros",
+    "weekly_adherence_header": "📅 Cumplimiento Semanal", "meals_hit_avg": "Comidas logradas (prom.)",
+    "workouts_completed": "Entrenamientos completados", "protein_target_days": "Días con meta de proteína",
+    "steps_target_days": "Días con meta de pasos", "measurements_header": "📏 Medidas Corporales",
+    "waist_label": "Cintura (cm)", "chest_label": "Pecho (cm)", "hips_label": "Caderas (cm)",
+    "arms_label": "Brazos (cm)", "thighs_label": "Muslos (cm)", "save_measurement": "Guardar medida",
+    "photos_header": "📸 Fotos de Progreso", "upload_photo": "Subir una foto",
+    "caption_label": "Descripción (opcional)", "save_photo": "Guardar foto",
+    "settings_header": "⚙️ Configuración", "edit_targets_header": "Edita tus metas",
+    "save_targets": "Guardar metas", "language_label": "Idioma",
+    "streak_header": "🔥 Racha e Insignias", "current_streak_label": "Racha actual",
+    "longest_streak_label": "Racha más larga", "days_logged_label": "Días registrados",
+    "badges_label": "Insignias obtenidas", "compare_header": "Comparar dos fotos", "delete_label": "Eliminar",
+    "profile_header": "🙋 Tu Perfil", "goal_label": "Objetivo", "height_label": "Altura (cm)",
+    "current_weight_label": "Peso Actual (kg)", "age_label": "Edad",
+    "sex_label": "Sexo biológico (para mayor precisión)", "country_label": "País",
+    "activity_label": "Nivel de actividad", "recalc_button": "Guardar y recalcular mis metas",
+    "targets_updated_msg": "¡Metas actualizadas según tu perfil!",
+    "profile_disclaimer": "Estas son estimaciones de fórmulas estándar, no un consejo médico. Ajusta libremente en Configuración.",
+    "bottle_0": "Empecemos 💪", "bottle_25": "¡Bien, calentando! 🔥",
+    "bottle_50": "¡A mitad de camino, sigue así! 💦", "bottle_75": "¡Casi lleno, no pares ahora! ⚡",
+    "bottle_100": "🎉 ¡Botella llena! ¡Entrenamiento completo!",
+}
+
+BASE_FR = {
+    "nav_today": "Aujourd'hui", "nav_weight_log": "Suivi du Poids", "nav_weekly_dashboard": "Tableau Hebdomadaire",
+    "nav_measurements": "Mesures", "nav_photos": "Photos de Progrès", "nav_settings": "Paramètres",
+    "nav_profile": "Profil", "gym_label": "Salle de sport", "meals_header": "🍽️ Repas",
+    "workout_header": "🏋️ Entraînement", "daily_numbers_header": "📊 Chiffres du Jour",
+    "weight_section_header": "⚖️ Poids", "notes_label": "Notes (facultatif)",
+    "save_button": "💾 Enregistrer le journal du jour", "saved_msg": "Enregistré !", "prev_day": "⬅ Jour précédent",
+    "next_day": "Jour suivant ➡", "done_label": "Fait", "what_did_you_have": "Qu'avez-vous mangé ?",
+    "calories_label": "Calories", "protein_label": "Protéines (g)", "use_meal_total": "Utiliser le total des repas",
+    "water_label": "Eau (L)", "steps_label": "Pas", "weight_label": "Poids (kg)",
+    "weight_trend_header": "⚖️ Tendance du Poids",
+    "no_weight_entries": "Aucune entrée de poids pour l'instant. Enregistrez votre poids sur la page Aujourd'hui.",
+    "latest_weight": "Dernier poids", "change_period": "Changement (période)", "entries_logged": "Entrées",
+    "weekly_adherence_header": "📅 Assiduité Hebdomadaire", "meals_hit_avg": "Repas atteints (moy.)",
+    "workouts_completed": "Entraînements terminés", "protein_target_days": "Jours objectif protéines",
+    "steps_target_days": "Jours objectif pas", "measurements_header": "📏 Mesures Corporelles",
+    "waist_label": "Taille (cm)", "chest_label": "Poitrine (cm)", "hips_label": "Hanches (cm)",
+    "arms_label": "Bras (cm)", "thighs_label": "Cuisses (cm)", "save_measurement": "Enregistrer la mesure",
+    "photos_header": "📸 Photos de Progrès", "upload_photo": "Téléverser une photo",
+    "caption_label": "Légende (facultatif)", "save_photo": "Enregistrer la photo",
+    "settings_header": "⚙️ Paramètres", "edit_targets_header": "Modifier vos objectifs",
+    "save_targets": "Enregistrer les objectifs", "language_label": "Langue",
+    "streak_header": "🔥 Série & Badges", "current_streak_label": "Série actuelle",
+    "longest_streak_label": "Plus longue série", "days_logged_label": "Jours enregistrés",
+    "badges_label": "Badges obtenus", "compare_header": "Comparer deux photos", "delete_label": "Supprimer",
+    "profile_header": "🙋 Votre Profil", "goal_label": "Objectif", "height_label": "Taille (cm)",
+    "current_weight_label": "Poids Actuel (kg)", "age_label": "Âge",
+    "sex_label": "Sexe biologique (pour plus de précision)", "country_label": "Pays",
+    "activity_label": "Niveau d'activité", "recalc_button": "Enregistrer et recalculer mes objectifs",
+    "targets_updated_msg": "Objectifs mis à jour selon votre profil !",
+    "profile_disclaimer": "Ce sont des estimations issues de formules standards, pas un avis médical. Ajustez librement dans Paramètres.",
+    "bottle_0": "Commençons 💪", "bottle_25": "Bien, on chauffe ! 🔥",
+    "bottle_50": "À mi-chemin, continuez ! 💦", "bottle_75": "Presque plein, ne lâchez rien ! ⚡",
+    "bottle_100": "🎉 Bouteille pleine ! Entraînement terminé !",
+}
+
+BASE_IT = {
+    "nav_today": "Oggi", "nav_weight_log": "Registro Peso", "nav_weekly_dashboard": "Cruscotto Settimanale",
+    "nav_measurements": "Misure", "nav_photos": "Foto di Progresso", "nav_settings": "Impostazioni",
+    "nav_profile": "Profilo", "gym_label": "Palestra", "meals_header": "🍽️ Pasti",
+    "workout_header": "🏋️ Allenamento", "daily_numbers_header": "📊 Numeri Giornalieri",
+    "weight_section_header": "⚖️ Peso", "notes_label": "Note (opzionale)",
+    "save_button": "💾 Salva registro di oggi", "saved_msg": "Salvato!", "prev_day": "⬅ Giorno precedente",
+    "next_day": "Giorno successivo ➡", "done_label": "Fatto", "what_did_you_have": "Cosa hai mangiato?",
+    "calories_label": "Calorie", "protein_label": "Proteine (g)", "use_meal_total": "Usa totale pasti",
+    "water_label": "Acqua (L)", "steps_label": "Passi", "weight_label": "Peso (kg)",
+    "weight_trend_header": "⚖️ Andamento del Peso",
+    "no_weight_entries": "Nessuna voce di peso ancora. Registra il tuo peso nella pagina Oggi.",
+    "latest_weight": "Peso più recente", "change_period": "Variazione (periodo)", "entries_logged": "Voci registrate",
+    "weekly_adherence_header": "📅 Aderenza Settimanale", "meals_hit_avg": "Pasti raggiunti (media)",
+    "workouts_completed": "Allenamenti completati", "protein_target_days": "Giorni obiettivo proteine",
+    "steps_target_days": "Giorni obiettivo passi", "measurements_header": "📏 Misure Corporee",
+    "waist_label": "Vita (cm)", "chest_label": "Petto (cm)", "hips_label": "Fianchi (cm)",
+    "arms_label": "Braccia (cm)", "thighs_label": "Cosce (cm)", "save_measurement": "Salva misura",
+    "photos_header": "📸 Foto di Progresso", "upload_photo": "Carica una foto",
+    "caption_label": "Didascalia (opzionale)", "save_photo": "Salva foto",
+    "settings_header": "⚙️ Impostazioni", "edit_targets_header": "Modifica i tuoi obiettivi",
+    "save_targets": "Salva obiettivi", "language_label": "Lingua",
+    "streak_header": "🔥 Serie & Distintivi", "current_streak_label": "Serie attuale",
+    "longest_streak_label": "Serie più lunga", "days_logged_label": "Giorni registrati",
+    "badges_label": "Distintivi ottenuti", "compare_header": "Confronta due foto", "delete_label": "Elimina",
+    "profile_header": "🙋 Il Tuo Profilo", "goal_label": "Obiettivo", "height_label": "Altezza (cm)",
+    "current_weight_label": "Peso Attuale (kg)", "age_label": "Età",
+    "sex_label": "Sesso biologico (per maggiore precisione)", "country_label": "Paese",
+    "activity_label": "Livello di attività", "recalc_button": "Salva e ricalcola i miei obiettivi",
+    "targets_updated_msg": "Obiettivi aggiornati in base al tuo profilo!",
+    "profile_disclaimer": "Queste sono stime da formule standard, non consigli medici. Modifica liberamente in Impostazioni.",
+    "bottle_0": "Iniziamo 💪", "bottle_25": "Bene, ti stai scaldando! 🔥",
+    "bottle_50": "A metà strada, continua così! 💦", "bottle_75": "Quasi pieno, non fermarti ora! ⚡",
+    "bottle_100": "🎉 Bottiglia piena! Allenamento completato!",
+}
+
+BASE_NL = {
+    "nav_today": "Vandaag", "nav_weight_log": "Gewichtslog", "nav_weekly_dashboard": "Weekoverzicht",
+    "nav_measurements": "Metingen", "nav_photos": "Voortgangsfoto's", "nav_settings": "Instellingen",
+    "nav_profile": "Profiel", "gym_label": "Sportschool", "meals_header": "🍽️ Maaltijden",
+    "workout_header": "🏋️ Training", "daily_numbers_header": "📊 Dagelijkse Cijfers",
+    "weight_section_header": "⚖️ Gewicht", "notes_label": "Notities (optioneel)",
+    "save_button": "💾 Log van vandaag opslaan", "saved_msg": "Opgeslagen!", "prev_day": "⬅ Vorige dag",
+    "next_day": "Volgende dag ➡", "done_label": "Klaar", "what_did_you_have": "Wat heb je gegeten?",
+    "calories_label": "Calorieën", "protein_label": "Eiwit (g)", "use_meal_total": "Gebruik maaltijdtotaal",
+    "water_label": "Water (L)", "steps_label": "Stappen", "weight_label": "Gewicht (kg)",
+    "weight_trend_header": "⚖️ Gewichtstrend",
+    "no_weight_entries": "Nog geen gewicht geregistreerd. Registreer je gewicht op de pagina Vandaag.",
+    "latest_weight": "Laatste gewicht", "change_period": "Verandering (periode)", "entries_logged": "Registraties",
+    "weekly_adherence_header": "📅 Wekelijkse Naleving", "meals_hit_avg": "Maaltijden behaald (gem.)",
+    "workouts_completed": "Trainingen voltooid", "protein_target_days": "Eiwitdoel-dagen",
+    "steps_target_days": "Stappendoel-dagen", "measurements_header": "📏 Lichaamsmaten",
+    "waist_label": "Taille (cm)", "chest_label": "Borst (cm)", "hips_label": "Heupen (cm)",
+    "arms_label": "Armen (cm)", "thighs_label": "Dijen (cm)", "save_measurement": "Meting opslaan",
+    "photos_header": "📸 Voortgangsfoto's", "upload_photo": "Foto uploaden",
+    "caption_label": "Bijschrift (optioneel)", "save_photo": "Foto opslaan",
+    "settings_header": "⚙️ Instellingen", "edit_targets_header": "Bewerk je doelen",
+    "save_targets": "Doelen opslaan", "language_label": "Taal",
+    "streak_header": "🔥 Reeks & Badges", "current_streak_label": "Huidige reeks",
+    "longest_streak_label": "Langste reeks", "days_logged_label": "Dagen geregistreerd",
+    "badges_label": "Verdiende badges", "compare_header": "Vergelijk twee foto's", "delete_label": "Verwijderen",
+    "profile_header": "🙋 Jouw Profiel", "goal_label": "Doel", "height_label": "Lengte (cm)",
+    "current_weight_label": "Huidig Gewicht (kg)", "age_label": "Leeftijd",
+    "sex_label": "Biologisch geslacht (voor nauwkeurigheid)", "country_label": "Land",
+    "activity_label": "Activiteitsniveau", "recalc_button": "Opslaan & doelen herberekenen",
+    "targets_updated_msg": "Doelen bijgewerkt op basis van je profiel!",
+    "profile_disclaimer": "Dit zijn schattingen op basis van standaardformules, geen medisch advies. Pas gerust aan bij Instellingen.",
+    "bottle_0": "Laten we beginnen 💪", "bottle_25": "Mooi, aan het opwarmen! 🔥",
+    "bottle_50": "Halverwege, ga zo door! 💦", "bottle_75": "Bijna vol, hou vol! ⚡",
+    "bottle_100": "🎉 Fles vol! Training voltooid!",
+}
+
+BASE_UR = {
+    "nav_today": "آج", "nav_weight_log": "وزن کا ریکارڈ", "nav_weekly_dashboard": "ہفتہ وار ڈیش بورڈ",
+    "nav_measurements": "پیمائش", "nav_photos": "پیش رفت کی تصاویر", "nav_settings": "ترتیبات",
+    "nav_profile": "پروفائل", "gym_label": "جم", "meals_header": "🍽️ کھانے", "workout_header": "🏋️ ورزش",
+    "daily_numbers_header": "📊 روزانہ کے اعداد", "weight_section_header": "⚖️ وزن",
+    "notes_label": "نوٹس (اختیاری)", "save_button": "💾 آج کا ریکارڈ محفوظ کریں", "saved_msg": "محفوظ ہو گیا!",
+    "prev_day": "⬅ پچھلا دن", "next_day": "اگلا دن ➡", "done_label": "مکمل",
+    "what_did_you_have": "آپ نے کیا کھایا؟", "calories_label": "کیلوریز", "protein_label": "پروٹین (g)",
+    "use_meal_total": "کھانے کا مجموعہ استعمال کریں", "water_label": "پانی (L)", "steps_label": "قدم",
+    "weight_label": "وزن (kg)", "weight_trend_header": "⚖️ وزن کا رجحان",
+    "no_weight_entries": "ابھی تک کوئی وزن درج نہیں ہوا۔ آج کے صفحے پر اپنا وزن درج کریں۔",
+    "latest_weight": "تازہ ترین وزن", "change_period": "تبدیلی (مدت)", "entries_logged": "درج اندراجات",
+    "weekly_adherence_header": "📅 ہفتہ وار پابندی", "meals_hit_avg": "حاصل شدہ کھانے (اوسط)",
+    "workouts_completed": "مکمل ورزشیں", "protein_target_days": "پروٹین ہدف کے دن",
+    "steps_target_days": "قدم ہدف کے دن", "measurements_header": "📏 جسمانی پیمائش",
+    "waist_label": "کمر (cm)", "chest_label": "سینہ (cm)", "hips_label": "کولہے (cm)",
+    "arms_label": "بازو (cm)", "thighs_label": "ران (cm)", "save_measurement": "پیمائش محفوظ کریں",
+    "photos_header": "📸 پیش رفت کی تصاویر", "upload_photo": "تصویر اپ لوڈ کریں",
+    "caption_label": "کیپشن (اختیاری)", "save_photo": "تصویر محفوظ کریں",
+    "settings_header": "⚙️ ترتیبات", "edit_targets_header": "اپنے اہداف میں ترمیم کریں",
+    "save_targets": "اہداف محفوظ کریں", "language_label": "زبان",
+    "streak_header": "🔥 تسلسل اور بیجز", "current_streak_label": "موجودہ تسلسل",
+    "longest_streak_label": "طویل ترین تسلسل", "days_logged_label": "درج دن",
+    "badges_label": "حاصل شدہ بیجز", "compare_header": "دو تصاویر کا موازنہ کریں", "delete_label": "حذف کریں",
+    "profile_header": "🙋 آپ کا پروفائل", "goal_label": "ہدف", "height_label": "قد (cm)",
+    "current_weight_label": "موجودہ وزن (kg)", "age_label": "عمر",
+    "sex_label": "حیاتیاتی جنس (درست حساب کے لیے)", "country_label": "ملک",
+    "activity_label": "سرگرمی کی سطح", "recalc_button": "محفوظ کریں اور اہداف دوبارہ شمار کریں",
+    "targets_updated_msg": "آپ کے پروفائل کی بنیاد پر اہداف اپ ڈیٹ ہو گئے!",
+    "profile_disclaimer": "یہ معیاری فارمولوں سے تخمینے ہیں، طبی مشورہ نہیں۔ ترتیبات میں آزادانہ طور پر ایڈجسٹ کریں۔",
+    "bottle_0": "چلیں شروع کرتے ہیں 💪", "bottle_25": "بہت خوب، گرمائش! 🔥",
+    "bottle_50": "آدھا سفر مکمل، جاری رکھیں! 💦", "bottle_75": "تقریباً بھر گیا — اب مت رکیں! ⚡",
+    "bottle_100": "🎉 بوتل بھر گئی! ورزش مکمل!",
+}
+
+BASE_AR = {
+    "nav_today": "اليوم", "nav_weight_log": "سجل الوزن", "nav_weekly_dashboard": "لوحة أسبوعية",
+    "nav_measurements": "القياسات", "nav_photos": "صور التقدم", "nav_settings": "الإعدادات",
+    "nav_profile": "الملف الشخصي", "gym_label": "النادي الرياضي", "meals_header": "🍽️ الوجبات",
+    "workout_header": "🏋️ التمرين", "daily_numbers_header": "📊 الأرقام اليومية", "weight_section_header": "⚖️ الوزن",
+    "notes_label": "ملاحظات (اختياري)", "save_button": "💾 حفظ سجل اليوم", "saved_msg": "تم الحفظ!",
+    "prev_day": "⬅ اليوم السابق", "next_day": "اليوم التالي ➡", "done_label": "منجز",
+    "what_did_you_have": "ماذا أكلت؟", "calories_label": "السعرات الحرارية", "protein_label": "البروتين (g)",
+    "use_meal_total": "استخدام مجموع الوجبات", "water_label": "الماء (L)", "steps_label": "الخطوات",
+    "weight_label": "الوزن (kg)", "weight_trend_header": "⚖️ اتجاه الوزن",
+    "no_weight_entries": "لا توجد إدخالات وزن بعد. سجل وزنك في صفحة اليوم.",
+    "latest_weight": "آخر وزن", "change_period": "التغيير (الفترة)", "entries_logged": "الإدخالات المسجلة",
+    "weekly_adherence_header": "📅 الالتزام الأسبوعي", "meals_hit_avg": "الوجبات المحققة (متوسط)",
+    "workouts_completed": "التمارين المكتملة", "protein_target_days": "أيام هدف البروتين",
+    "steps_target_days": "أيام هدف الخطوات", "measurements_header": "📏 قياسات الجسم",
+    "waist_label": "الخصر (cm)", "chest_label": "الصدر (cm)", "hips_label": "الوركين (cm)",
+    "arms_label": "الذراعين (cm)", "thighs_label": "الفخذين (cm)", "save_measurement": "حفظ القياس",
+    "photos_header": "📸 صور التقدم", "upload_photo": "رفع صورة", "caption_label": "تعليق (اختياري)",
+    "save_photo": "حفظ الصورة", "settings_header": "⚙️ الإعدادات", "edit_targets_header": "تعديل أهدافك",
+    "save_targets": "حفظ الأهداف", "language_label": "اللغة", "streak_header": "🔥 التتابع والشارات",
+    "current_streak_label": "التتابع الحالي", "longest_streak_label": "أطول تتابع",
+    "days_logged_label": "الأيام المسجلة", "badges_label": "الشارات المكتسبة",
+    "compare_header": "قارن بين صورتين", "delete_label": "حذف",
+    "profile_header": "🙋 ملفك الشخصي", "goal_label": "الهدف", "height_label": "الطول (cm)",
+    "current_weight_label": "الوزن الحالي (kg)", "age_label": "العمر",
+    "sex_label": "الجنس البيولوجي (لدقة الحساب)", "country_label": "البلد",
+    "activity_label": "مستوى النشاط", "recalc_button": "حفظ وإعادة حساب أهدافي",
+    "targets_updated_msg": "تم تحديث الأهداف بناءً على ملفك الشخصي!",
+    "profile_disclaimer": "هذه تقديرات من معادلات قياسية، وليست نصيحة طبية. عدّل بحرية في الإعدادات.",
+    "bottle_0": "لنبدأ 💪", "bottle_25": "جيد، بدأ الإحماء! 🔥",
+    "bottle_50": "في منتصف الطريق، واصل! 💦", "bottle_75": "أوشكت على الامتلاء — لا تتوقف الآن! ⚡",
+    "bottle_100": "🎉 الزجاجة ممتلئة! التمرين اكتمل!",
+}
+
+BASE_DE = {
+    "nav_today": "Heute", "nav_weight_log": "Gewichtsprotokoll", "nav_weekly_dashboard": "Wochenübersicht",
+    "nav_measurements": "Maße", "nav_photos": "Fortschrittsfotos", "nav_settings": "Einstellungen",
+    "nav_profile": "Profil", "gym_label": "Fitnessstudio", "meals_header": "🍽️ Mahlzeiten",
+    "workout_header": "🏋️ Training", "daily_numbers_header": "📊 Tageswerte", "weight_section_header": "⚖️ Gewicht",
+    "notes_label": "Notizen (optional)", "save_button": "💾 Heutigen Eintrag speichern", "saved_msg": "Gespeichert!",
+    "prev_day": "⬅ Vorheriger Tag", "next_day": "Nächster Tag ➡", "done_label": "Erledigt",
+    "what_did_you_have": "Was hast du gegessen?", "calories_label": "Kalorien", "protein_label": "Eiweiß (g)",
+    "use_meal_total": "Mahlzeit-Summe verwenden", "water_label": "Wasser (L)", "steps_label": "Schritte",
+    "weight_label": "Gewicht (kg)", "weight_trend_header": "⚖️ Gewichtsverlauf",
+    "no_weight_entries": "Noch keine Gewichtseinträge. Trage dein Gewicht auf der Heute-Seite ein.",
+    "latest_weight": "Letztes Gewicht", "change_period": "Veränderung (Zeitraum)", "entries_logged": "Einträge",
+    "weekly_adherence_header": "📅 Wöchentliche Einhaltung", "meals_hit_avg": "Mahlzeiten erreicht (Ø)",
+    "workouts_completed": "Trainings abgeschlossen", "protein_target_days": "Eiweißziel-Tage",
+    "steps_target_days": "Schrittziel-Tage", "measurements_header": "📏 Körpermaße",
+    "waist_label": "Taille (cm)", "chest_label": "Brust (cm)", "hips_label": "Hüfte (cm)",
+    "arms_label": "Arme (cm)", "thighs_label": "Oberschenkel (cm)", "save_measurement": "Maß speichern",
+    "photos_header": "📸 Fortschrittsfotos", "upload_photo": "Foto hochladen",
+    "caption_label": "Bildunterschrift (optional)", "save_photo": "Foto speichern",
+    "settings_header": "⚙️ Einstellungen", "edit_targets_header": "Ziele bearbeiten",
+    "save_targets": "Ziele speichern", "language_label": "Sprache", "streak_header": "🔥 Serie & Abzeichen",
+    "current_streak_label": "Aktuelle Serie", "longest_streak_label": "Längste Serie",
+    "days_logged_label": "Erfasste Tage", "badges_label": "Verdiente Abzeichen",
+    "compare_header": "Zwei Fotos vergleichen", "delete_label": "Löschen",
+    "profile_header": "🙋 Dein Profil", "goal_label": "Ziel", "height_label": "Größe (cm)",
+    "current_weight_label": "Aktuelles Gewicht (kg)", "age_label": "Alter",
+    "sex_label": "Biologisches Geschlecht (für Genauigkeit)", "country_label": "Land",
+    "activity_label": "Aktivitätslevel", "recalc_button": "Speichern & Ziele neu berechnen",
+    "targets_updated_msg": "Ziele basierend auf deinem Profil aktualisiert!",
+    "profile_disclaimer": "Dies sind Schätzungen aus Standardformeln, kein medizinischer Rat. Passe sie frei in den Einstellungen an.",
+    "bottle_0": "Los geht's 💪", "bottle_25": "Gut, du wärmst dich auf! 🔥",
+    "bottle_50": "Auf halbem Weg, weiter so! 💦", "bottle_75": "Fast voll — jetzt nicht aufhören! ⚡",
+    "bottle_100": "🎉 Flasche voll! Training abgeschlossen!",
+}
+
+TRANSLATIONS = {
+    "English": BASE_EN, "Afrikaans": BASE_AF, "Spanish": BASE_ES, "French": BASE_FR,
+    "Italian": BASE_IT, "Dutch": BASE_NL, "Urdu": BASE_UR, "Arabic": BASE_AR, "German": BASE_DE,
+}
+# app_title stays the same brand name across all languages
+for lang in TRANSLATIONS:
+    TRANSLATIONS[lang]["app_title"] = "⚡ Momentum"
+
+def t(key):
+    lang = st.session_state.get("language", "English")
+    return TRANSLATIONS.get(lang, {}).get(key, TRANSLATIONS["English"].get(key, key))
 
 # ---------------------------------------------------------------
 # DATABASE (Postgres via Supabase)
@@ -52,55 +405,38 @@ def get_conn():
     conn = psycopg2.connect(st.secrets["connections"]["postgres"]["url"])
     conn.autocommit = True
     cur = conn.cursor()
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS daily_log (
-            log_date TEXT PRIMARY KEY,
-            protein_g REAL DEFAULT 0,
-            water_l REAL DEFAULT 0,
-            steps INTEGER DEFAULT 0,
-            weight_kg REAL,
-            notes TEXT
-        )
-    """)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS meal_checks (
-            log_date TEXT,
-            meal TEXT,
-            done INTEGER DEFAULT 0,
-            PRIMARY KEY (log_date, meal)
-        )
-    """)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS meal_details (
-            log_date TEXT,
-            meal TEXT,
-            note TEXT DEFAULT '',
-            calories REAL DEFAULT 0,
-            protein_g REAL DEFAULT 0,
-            PRIMARY KEY (log_date, meal)
-        )
-    """)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS exercise_checks (
-            log_date TEXT,
-            exercise TEXT,
-            done INTEGER DEFAULT 0,
-            PRIMARY KEY (log_date, exercise)
-        )
-    """)
+    cur.execute("""CREATE TABLE IF NOT EXISTS daily_log (
+        log_date TEXT PRIMARY KEY, protein_g REAL DEFAULT 0, water_l REAL DEFAULT 0,
+        steps INTEGER DEFAULT 0, weight_kg REAL, notes TEXT)""")
+    cur.execute("""CREATE TABLE IF NOT EXISTS meal_checks (
+        log_date TEXT, meal TEXT, done INTEGER DEFAULT 0, PRIMARY KEY (log_date, meal))""")
+    cur.execute("""CREATE TABLE IF NOT EXISTS meal_details (
+        log_date TEXT, meal TEXT, note TEXT DEFAULT '', calories REAL DEFAULT 0,
+        protein_g REAL DEFAULT 0, PRIMARY KEY (log_date, meal))""")
+    cur.execute("""CREATE TABLE IF NOT EXISTS exercise_checks (
+        log_date TEXT, exercise TEXT, done INTEGER DEFAULT 0, PRIMARY KEY (log_date, exercise))""")
+    cur.execute("""CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY, value TEXT)""")
+    cur.execute("""CREATE TABLE IF NOT EXISTS body_measurements (
+        log_date TEXT PRIMARY KEY, waist_cm REAL, chest_cm REAL, hips_cm REAL,
+        arms_cm REAL, thighs_cm REAL)""")
+    cur.execute("""CREATE TABLE IF NOT EXISTS progress_photos (
+        id SERIAL PRIMARY KEY, log_date TEXT, caption TEXT, photo_data BYTEA,
+        uploaded_at TIMESTAMP DEFAULT now())""")
+    # NEW: profile (single row)
+    cur.execute("""CREATE TABLE IF NOT EXISTS profile (
+        id INTEGER PRIMARY KEY DEFAULT 1, goal TEXT, height_cm REAL, weight_kg REAL,
+        age INTEGER, sex TEXT, country TEXT, activity_level TEXT)""")
     cur.close()
     return conn
 
 conn = get_conn()
 
 def run(query, params=()):
-    """Execute a write query."""
     cur = conn.cursor()
     cur.execute(query, params)
     cur.close()
 
 def fetch(query, params=()):
-    """Execute a read query and return raw rows + column names."""
     cur = conn.cursor()
     cur.execute(query, params)
     cols = [d[0] for d in cur.description]
@@ -108,6 +444,92 @@ def fetch(query, params=()):
     cur.close()
     return cols, rows
 
+# ---------------------------------------------------------------
+# SETTINGS / TARGETS
+# ---------------------------------------------------------------
+def get_setting(key, default=None):
+    cols, rows = fetch("SELECT value FROM app_settings WHERE key=%s", (key,))
+    return rows[0][0] if rows else default
+
+def set_setting(key, value):
+    run("""INSERT INTO app_settings (key, value) VALUES (%s, %s)
+           ON CONFLICT (key) DO UPDATE SET value=excluded.value""", (key, str(value)))
+
+def load_targets():
+    targets = DEFAULT_TARGETS.copy()
+    for key in DEFAULT_TARGETS:
+        val = get_setting(f"target_{key}")
+        if val is not None:
+            targets[key] = float(val)
+    return targets
+
+def save_targets(new_targets):
+    for key, val in new_targets.items():
+        set_setting(f"target_{key}", val)
+
+# ---------------------------------------------------------------
+# PROFILE
+# ---------------------------------------------------------------
+def get_profile():
+    cols, rows = fetch("SELECT * FROM profile WHERE id=1")
+    if not rows:
+        return {"goal": GOALS[2], "height_cm": None, "weight_kg": None, "age": None,
+                "sex": SEX_OPTIONS[2], "country": "", "activity_level": ACTIVITY_LEVELS[2]}
+    return dict(zip(cols, rows[0]))
+
+def save_profile(goal, height_cm, weight_kg, age, sex, country, activity_level):
+    run("""
+        INSERT INTO profile (id, goal, height_cm, weight_kg, age, sex, country, activity_level)
+        VALUES (1, %s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (id) DO UPDATE SET
+            goal=excluded.goal, height_cm=excluded.height_cm, weight_kg=excluded.weight_kg,
+            age=excluded.age, sex=excluded.sex, country=excluded.country,
+            activity_level=excluded.activity_level
+    """, (goal, height_cm, weight_kg, age, sex, country, activity_level))
+
+def compute_targets_from_profile(profile):
+    """Standard BMR/TDEE-based estimate. Not medical advice — a sensible starting point."""
+    h, w, age = profile["height_cm"], profile["weight_kg"], profile["age"]
+    sex, activity, goal = profile["sex"], profile["activity_level"], profile["goal"]
+    if not h or not w or not age:
+        return None
+
+    if sex == "Male":
+        bmr = 10 * w + 6.25 * h - 5 * age + 5
+    elif sex == "Female":
+        bmr = 10 * w + 6.25 * h - 5 * age - 161
+    else:
+        bmr = (10 * w + 6.25 * h - 5 * age + 5 + 10 * w + 6.25 * h - 5 * age - 161) / 2
+
+    tdee = bmr * ACTIVITY_MULTIPLIERS.get(activity, 1.4)
+
+    if goal == "Lose weight":
+        cal_min, cal_max = tdee - 600, tdee - 300
+        prot_min, prot_max = w * 1.8, w * 2.2
+    elif goal == "Gain muscle":
+        cal_min, cal_max = tdee + 200, tdee + 450
+        prot_min, prot_max = w * 1.8, w * 2.2
+    elif goal == "Body recomposition":
+        cal_min, cal_max = tdee - 200, tdee + 100
+        prot_min, prot_max = w * 2.0, w * 2.4
+    else:  # Maintain
+        cal_min, cal_max = tdee - 100, tdee + 100
+        prot_min, prot_max = w * 1.6, w * 2.0
+
+    water_min, water_max = w * 0.035, w * 0.045
+    steps_min = 8000 if activity in ("Sedentary (little exercise)", "Light (1-3 days/week)") else 10000
+    steps_max = steps_min + 5000
+
+    return {
+        "calories_min": round(cal_min), "calories_max": round(cal_max),
+        "protein_min": round(prot_min), "protein_max": round(prot_max),
+        "water_min": round(water_min, 1), "water_max": round(water_max, 1),
+        "steps_min": steps_min, "steps_max": steps_max,
+    }
+
+# ---------------------------------------------------------------
+# DAILY LOG / MEALS / EXERCISES
+# ---------------------------------------------------------------
 def get_daily_row(log_date):
     cols, rows = fetch("SELECT * FROM daily_log WHERE log_date = %s", (log_date,))
     if not rows:
@@ -116,10 +538,8 @@ def get_daily_row(log_date):
     return dict(zip(cols, rows[0]))
 
 def save_daily_row(log_date, protein_g, water_l, steps, weight_kg, notes):
-    run("""
-        UPDATE daily_log SET protein_g=%s, water_l=%s, steps=%s, weight_kg=%s, notes=%s
-        WHERE log_date=%s
-    """, (protein_g, water_l, steps, weight_kg, notes, log_date))
+    run("""UPDATE daily_log SET protein_g=%s, water_l=%s, steps=%s, weight_kg=%s, notes=%s
+           WHERE log_date=%s""", (protein_g, water_l, steps, weight_kg, notes, log_date))
 
 def get_meal_checks(log_date):
     cols, rows = fetch("SELECT meal, done FROM meal_checks WHERE log_date=%s", (log_date,))
@@ -127,24 +547,20 @@ def get_meal_checks(log_date):
     return {m: bool(existing.get(m, 0)) for m in MEALS}
 
 def set_meal_check(log_date, meal, done):
-    run("""
-        INSERT INTO meal_checks (log_date, meal, done) VALUES (%s, %s, %s)
-        ON CONFLICT (log_date, meal) DO UPDATE SET done=excluded.done
-    """, (log_date, meal, int(done)))
+    run("""INSERT INTO meal_checks (log_date, meal, done) VALUES (%s, %s, %s)
+           ON CONFLICT (log_date, meal) DO UPDATE SET done=excluded.done""", (log_date, meal, int(done)))
 
 def get_meal_details(log_date):
     cols, rows = fetch(
-        "SELECT meal, note, calories, protein_g FROM meal_details WHERE log_date=%s", (log_date,)
-    )
+        "SELECT meal, note, calories, protein_g FROM meal_details WHERE log_date=%s", (log_date,))
     existing = {r[0]: {"note": r[1] or "", "calories": r[2] or 0, "protein_g": r[3] or 0} for r in rows}
     return {m: existing.get(m, {"note": "", "calories": 0, "protein_g": 0}) for m in MEALS}
 
 def set_meal_detail(log_date, meal, note, calories, protein_g):
-    run("""
-        INSERT INTO meal_details (log_date, meal, note, calories, protein_g) VALUES (%s, %s, %s, %s, %s)
-        ON CONFLICT (log_date, meal) DO UPDATE SET
-            note=excluded.note, calories=excluded.calories, protein_g=excluded.protein_g
-    """, (log_date, meal, note, calories, protein_g))
+    run("""INSERT INTO meal_details (log_date, meal, note, calories, protein_g) VALUES (%s, %s, %s, %s, %s)
+           ON CONFLICT (log_date, meal) DO UPDATE SET
+           note=excluded.note, calories=excluded.calories, protein_g=excluded.protein_g""",
+        (log_date, meal, note, calories, protein_g))
 
 def get_exercise_checks(log_date, exercises):
     cols, rows = fetch("SELECT exercise, done FROM exercise_checks WHERE log_date=%s", (log_date,))
@@ -152,54 +568,393 @@ def get_exercise_checks(log_date, exercises):
     return {e: bool(existing.get(e, 0)) for e in exercises}
 
 def set_exercise_check(log_date, exercise, done):
-    run("""
-        INSERT INTO exercise_checks (log_date, exercise, done) VALUES (%s, %s, %s)
-        ON CONFLICT (log_date, exercise) DO UPDATE SET done=excluded.done
-    """, (log_date, exercise, int(done)))
+    run("""INSERT INTO exercise_checks (log_date, exercise, done) VALUES (%s, %s, %s)
+           ON CONFLICT (log_date, exercise) DO UPDATE SET done=excluded.done""",
+        (log_date, exercise, int(done)))
+
+def get_all_logged_exercises(log_date):
+    """All exercise_checks rows for a date, including anything added beyond the fixed plan."""
+    cols, rows = fetch("SELECT exercise, done FROM exercise_checks WHERE log_date=%s", (log_date,))
+    return dict(rows)
+
+def remove_exercise(log_date, exercise):
+    run("DELETE FROM exercise_checks WHERE log_date=%s AND exercise=%s", (log_date, exercise))
 
 def get_range_df(start, end):
     q = "SELECT * FROM daily_log WHERE log_date BETWEEN %s AND %s ORDER BY log_date"
     return pd.read_sql_query(q, conn, params=(start.isoformat(), end.isoformat()))
 
 def get_meal_completion_for_range(start, end):
-    q = """
-        SELECT log_date, SUM(done) as done_count FROM meal_checks
-        WHERE log_date BETWEEN %s AND %s GROUP BY log_date
-    """
+    q = """SELECT log_date, SUM(done) as done_count FROM meal_checks
+           WHERE log_date BETWEEN %s AND %s GROUP BY log_date"""
     return pd.read_sql_query(q, conn, params=(start.isoformat(), end.isoformat()))
 
 def get_exercise_completion_for_range(start, end):
-    q = """
-        SELECT log_date, COUNT(*) as total, SUM(done) as done_count FROM exercise_checks
-        WHERE log_date BETWEEN %s AND %s GROUP BY log_date
-    """
+    q = """SELECT log_date, COUNT(*) as total, SUM(done) as done_count FROM exercise_checks
+           WHERE log_date BETWEEN %s AND %s GROUP BY log_date"""
     return pd.read_sql_query(q, conn, params=(start.isoformat(), end.isoformat()))
 
 def get_meal_macro_totals_for_range(start, end):
-    q = """
-        SELECT log_date, SUM(calories) as calories_total, SUM(protein_g) as meal_protein_total
-        FROM meal_details WHERE log_date BETWEEN %s AND %s GROUP BY log_date
-    """
+    q = """SELECT log_date, SUM(calories) as calories_total, SUM(protein_g) as meal_protein_total
+           FROM meal_details WHERE log_date BETWEEN %s AND %s GROUP BY log_date"""
     return pd.read_sql_query(q, conn, params=(start.isoformat(), end.isoformat()))
+
+# ---------------------------------------------------------------
+# BODY MEASUREMENTS
+# ---------------------------------------------------------------
+def get_measurement_row(log_date):
+    cols, rows = fetch("SELECT * FROM body_measurements WHERE log_date=%s", (log_date,))
+    if not rows:
+        return {"waist_cm": None, "chest_cm": None, "hips_cm": None, "arms_cm": None, "thighs_cm": None}
+    return dict(zip(cols, rows[0]))
+
+def save_measurement(log_date, waist, chest, hips, arms, thighs):
+    run("""INSERT INTO body_measurements (log_date, waist_cm, chest_cm, hips_cm, arms_cm, thighs_cm)
+           VALUES (%s, %s, %s, %s, %s, %s)
+           ON CONFLICT (log_date) DO UPDATE SET
+           waist_cm=excluded.waist_cm, chest_cm=excluded.chest_cm, hips_cm=excluded.hips_cm,
+           arms_cm=excluded.arms_cm, thighs_cm=excluded.thighs_cm""",
+        (log_date, waist, chest, hips, arms, thighs))
+
+def get_all_measurements():
+    return pd.read_sql_query("SELECT * FROM body_measurements ORDER BY log_date", conn)
+
+# ---------------------------------------------------------------
+# PROGRESS PHOTOS
+# ---------------------------------------------------------------
+def save_photo(log_date, caption, photo_bytes):
+    run("INSERT INTO progress_photos (log_date, caption, photo_data) VALUES (%s, %s, %s)",
+        (log_date, caption, psycopg2.Binary(photo_bytes)))
+
+def get_all_photos():
+    cols, rows = fetch("SELECT id, log_date, caption, photo_data FROM progress_photos ORDER BY log_date DESC")
+    return [dict(zip(cols, r)) for r in rows]
+
+def delete_photo(photo_id):
+    run("DELETE FROM progress_photos WHERE id=%s", (photo_id,))
+
+# ---------------------------------------------------------------
+# STREAKS & BADGES
+# ---------------------------------------------------------------
+def get_active_dates_df():
+    cols, rows = fetch("""
+        SELECT d.log_date, COALESCE(d.protein_g,0) as protein_g, COALESCE(d.water_l,0) as water_l,
+               COALESCE(d.steps,0) as steps, COALESCE(m.done_count,0) as meals_done,
+               COALESCE(e.done_count,0) as ex_done
+        FROM daily_log d
+        LEFT JOIN (SELECT log_date, SUM(done) as done_count FROM meal_checks GROUP BY log_date) m
+            ON d.log_date = m.log_date
+        LEFT JOIN (SELECT log_date, SUM(done) as done_count FROM exercise_checks GROUP BY log_date) e
+            ON d.log_date = e.log_date
+    """)
+    df = pd.DataFrame(rows, columns=cols)
+    if df.empty:
+        return df
+    df["active"] = (df["protein_g"] > 0) | (df["water_l"] > 0) | (df["steps"] > 0) | \
+                    (df["meals_done"] > 0) | (df["ex_done"] > 0)
+    return df[df["active"]]
+
+def compute_streak_stats():
+    df = get_active_dates_df()
+    if df.empty:
+        return 0, 0, 0
+    dates = sorted(pd.to_datetime(df["log_date"]).dt.date.tolist())
+    date_set = set(dates)
+    longest, current_run = 1, 1
+    for i in range(1, len(dates)):
+        if (dates[i] - dates[i - 1]).days == 1:
+            current_run += 1
+        else:
+            longest = max(longest, current_run)
+            current_run = 1
+    longest = max(longest, current_run)
+    today = date.today()
+    streak, check = 0, today
+    while check in date_set:
+        streak += 1
+        check -= timedelta(days=1)
+    if streak == 0:
+        check = today - timedelta(days=1)
+        while check in date_set:
+            streak += 1
+            check -= timedelta(days=1)
+    return streak, longest, len(dates)
+
+STREAK_BADGES = [(3, "🔥 3-Day Streak"), (7, "🔥 7-Day Streak"), (14, "🔥 14-Day Streak"),
+                  (30, "🏆 30-Day Streak"), (100, "💎 100-Day Streak")]
+DAYS_BADGES = [(10, "📅 10 Days Logged"), (50, "📅 50 Days Logged"), (100, "📅 100 Days Logged")]
+
+def get_earned_badges(longest_streak, total_days):
+    earned = [name for threshold, name in STREAK_BADGES if longest_streak >= threshold]
+    earned += [name for threshold, name in DAYS_BADGES if total_days >= threshold]
+    return earned
+
+# ---------------------------------------------------------------
+# BOTTLE ANIMATION
+# ---------------------------------------------------------------
+def render_confetti():
+    html = """
+    <canvas id="confetti-canvas" style="width:100%;height:160px;display:block;"></canvas>
+    <script>
+    const canvas = document.getElementById('confetti-canvas');
+    const ctx = canvas.getContext('2d');
+    canvas.width = canvas.offsetWidth; canvas.height = 160;
+    const colors = ['#3b82f6','#f59e0b','#10b981','#ef4444','#8b5cf6'];
+    let particles = [];
+    for (let i=0;i<80;i++){
+      particles.push({
+        x: Math.random()*canvas.width, y: -20 - Math.random()*100,
+        vx: (Math.random()-0.5)*3, vy: 2+Math.random()*3,
+        size: 4+Math.random()*4, color: colors[Math.floor(Math.random()*colors.length)],
+        rot: Math.random()*360, vrot: (Math.random()-0.5)*10
+      });
+    }
+    let frame = 0;
+    function draw(){
+      ctx.clearRect(0,0,canvas.width,canvas.height);
+      particles.forEach(p=>{
+        p.x+=p.vx; p.y+=p.vy; p.rot+=p.vrot;
+        ctx.save();
+        ctx.translate(p.x,p.y); ctx.rotate(p.rot*Math.PI/180);
+        ctx.fillStyle=p.color;
+        ctx.fillRect(-p.size/2,-p.size/2,p.size,p.size);
+        ctx.restore();
+      });
+      frame++;
+      if (frame<90) requestAnimationFrame(draw);
+    }
+    draw();
+    </script>
+    """
+    components.html(html, height=170)
+
+def render_meal_stamp():
+    html = """
+    <style>
+    @keyframes stampIn {
+      0% { transform: scale(2) rotate(-15deg); opacity:0; }
+      60% { transform: scale(0.9) rotate(5deg); opacity:1; }
+      100% { transform: scale(1) rotate(-8deg); opacity:1; }
+    }
+    .stamp {
+      display:inline-block; font-weight:800; font-size:1rem; color:#10b981;
+      border:2px solid #10b981; border-radius:6px; padding:2px 8px;
+      animation: stampIn 0.4s ease-out; transform: rotate(-8deg);
+    }
+    </style>
+    <div class="stamp">✅ DONE</div>
+    """
+    components.html(html, height=40)
+
+def render_animated_number(value, suffix="kg", duration_ms=900):
+    html = f"""
+    <div style="font-size:2rem; font-weight:700;" id="counter">0{suffix}</div>
+    <script>
+    let start = null; const target = {value}; const duration = {duration_ms};
+    function step(ts){{
+      if(!start) start = ts;
+      const progress = Math.min((ts-start)/duration, 1);
+      const current = (target*progress).toFixed(1);
+      document.getElementById('counter').innerText = current + "{suffix}";
+      if(progress<1) requestAnimationFrame(step);
+    }}
+    requestAnimationFrame(step);
+    </script>
+    """
+    components.html(html, height=60)
+
+def render_trend_arrow(delta, unit="kg"):
+    color = "#ef4444" if delta > 0 else ("#10b981" if delta < 0 else "#6b7280")
+    arrow = "▲" if delta > 0 else ("▼" if delta < 0 else "▬")
+    html = f"""
+    <style>
+    @keyframes slideIn {{
+      0% {{ transform: translateX(-12px); opacity:0; }}
+      100% {{ transform: translateX(0); opacity:1; }}
+    }}
+    .trend-arrow {{ animation: slideIn 0.4s ease-out; font-size:1.4rem; font-weight:700; color:{color}; }}
+    </style>
+    <div class="trend-arrow">{arrow} {abs(delta):.1f} {unit}</div>
+    """
+    components.html(html, height=40)
+
+def render_delta_badge(delta, unit="cm"):
+    if delta is None:
+        return
+    color = "#ef4444" if delta > 0 else ("#10b981" if delta < 0 else "#6b7280")
+    arrow = "▲" if delta > 0 else ("▼" if delta < 0 else "▬")
+    html = f"""
+    <style>
+    @keyframes slideInSmall {{ 0% {{transform:translateX(-8px);opacity:0;}} 100%{{transform:translateX(0);opacity:1;}} }}
+    .delta-badge {{ animation: slideInSmall 0.35s ease-out; font-size:0.85rem; font-weight:600; color:{color}; }}
+    </style>
+    <div class="delta-badge">{arrow} {abs(delta):.1f}{unit} since last</div>
+    """
+    components.html(html, height=26)
+
+def render_animated_bars(labels, values, max_value, value_suffix=""):
+    bars = ""
+    for i, (lab, val) in enumerate(zip(labels, values)):
+        pct_of_max = (val / max_value * 100) if max_value else 0
+        bars += f"""
+        <div class="bar-col" data-target="{pct_of_max}" style="display:flex;flex-direction:column;align-items:center;flex:1;">
+          <div style="font-size:0.7rem;margin-bottom:4px;">{val:.0f}{value_suffix}</div>
+          <div style="width:70%;height:120px;background:#eef2f7;border-radius:4px;display:flex;align-items:flex-end;overflow:hidden;">
+            <div class="bar-fill" style="width:100%;height:0%;background:#3b82f6;border-radius:4px 4px 0 0;transition:height 0.6s ease-out;"></div>
+          </div>
+          <div style="font-size:0.7rem;margin-top:4px;">{lab}</div>
+        </div>
+        """
+    html = f"""
+    <div style="display:flex; gap:6px; align-items:flex-end; padding:10px 0;">{bars}</div>
+    <script>
+    const cols = document.querySelectorAll('.bar-col');
+    cols.forEach((col, i) => {{
+      const target = col.getAttribute('data-target');
+      const fill = col.querySelector('.bar-fill');
+      setTimeout(() => {{ fill.style.height = target + '%'; }}, i*80);
+    }});
+    </script>
+    """
+    components.html(html, height=200)
+
+def render_compare_slider(bytes_a, bytes_b):
+    b64_a = base64.b64encode(bytes_a).decode()
+    b64_b = base64.b64encode(bytes_b).decode()
+    html = f"""
+    <style>
+    .compare-wrap {{ position:relative; width:100%; max-width:400px; margin:auto; overflow:hidden; border-radius:8px; }}
+    .compare-wrap img {{ display:block; width:100%; }}
+    .compare-after {{ position:absolute; top:0; left:0; width:50%; height:100%; overflow:hidden; }}
+    .compare-after img {{ max-width:none; }}
+    .compare-slider {{ position:absolute; top:0; bottom:0; left:50%; width:3px; background:white;
+                        cursor:ew-resize; box-shadow:0 0 4px rgba(0,0,0,0.5); }}
+    .compare-handle {{ position:absolute; top:50%; left:50%; transform:translate(-50%,-50%);
+                        width:32px; height:32px; background:white; border-radius:50%; cursor:ew-resize;
+                        display:flex; align-items:center; justify-content:center; font-size:14px; box-shadow:0 0 4px rgba(0,0,0,0.5); }}
+    </style>
+    <div class="compare-wrap" id="cwrap">
+      <img src="data:image/png;base64,{b64_b}" id="img-before"/>
+      <div class="compare-after" id="cafter">
+        <img src="data:image/png;base64,{b64_a}" id="img-after"/>
+      </div>
+      <div class="compare-slider" id="cslider" style="left:50%;">
+        <div class="compare-handle">↔</div>
+      </div>
+    </div>
+    <script>
+    const wrap = document.getElementById('cwrap');
+    const after = document.getElementById('cafter');
+    const slider = document.getElementById('cslider');
+    const imgAfter = document.getElementById('img-after');
+    function setWidth() {{ imgAfter.style.width = wrap.offsetWidth + 'px'; }}
+    setWidth();
+    window.addEventListener('resize', setWidth);
+    let dragging = false;
+    function moveTo(x) {{
+      const rect = wrap.getBoundingClientRect();
+      let pct = ((x - rect.left) / rect.width) * 100;
+      pct = Math.max(0, Math.min(100, pct));
+      after.style.width = pct + '%';
+      slider.style.left = pct + '%';
+    }}
+    slider.addEventListener('mousedown', ()=>dragging=true);
+    window.addEventListener('mouseup', ()=>dragging=false);
+    window.addEventListener('mousemove', (e)=>{{ if(dragging) moveTo(e.clientX); }});
+    slider.addEventListener('touchstart', ()=>dragging=true);
+    window.addEventListener('touchend', ()=>dragging=false);
+    window.addEventListener('touchmove', (e)=>{{ if(dragging) moveTo(e.touches[0].clientX); }});
+    </script>
+    """
+    components.html(html, height=420)
+
+def render_bottle(pct, message):
+    pct = max(0, min(100, pct))
+    glow_style = ""
+    if 75 <= pct < 100:
+        glow_style = """
+        <style>
+        @keyframes pulseGlow {
+          0%,100% { filter: drop-shadow(0 0 2px #3b82f6); }
+          50% { filter: drop-shadow(0 0 12px #3b82f6); }
+        }
+        .bottle-wrap svg { animation: pulseGlow 1.4s ease-in-out infinite; }
+        </style>
+        """
+    html = f"""
+    {glow_style}
+    <div class="bottle-wrap" style="display:flex; flex-direction:column; align-items:center; padding:10px 0;">
+      <svg width="110" height="220" viewBox="0 0 110 220">
+        <defs>
+          <clipPath id="bottleClip">
+            <path d="M40,10 L70,10 L70,35 C70,35 85,45 85,65 L85,195
+                     C85,208 75,215 55,215 C35,215 25,208 25,195
+                     L25,65 C25,45 40,35 40,35 Z"/>
+          </clipPath>
+        </defs>
+        <path d="M40,10 L70,10 L70,35 C70,35 85,45 85,65 L85,195
+                 C85,208 75,215 55,215 C35,215 25,208 25,195
+                 L25,65 C25,45 40,35 40,35 Z"
+              fill="#eef2f7" stroke="#93a3b8" stroke-width="2"/>
+        <rect x="0" y="{215 - (205 * pct / 100)}" width="110" height="{205 * pct / 100}"
+              fill="#3b82f6" clip-path="url(#bottleClip)"
+              style="transition: y 0.6s ease, height 0.6s ease;"/>
+        <rect x="42" y="2" width="26" height="12" rx="3" fill="#93a3b8"/>
+      </svg>
+      <div style="margin-top:8px; font-weight:600; font-size:0.95rem; text-align:center;">{pct:.0f}%</div>
+      <div style="margin-top:2px; font-size:0.9rem; text-align:center; color:#555;">{message}</div>
+    </div>
+    """
+    components.html(html, height=290)
+    if pct >= 100:
+        render_confetti()
+
+def get_bottle_message(pct):
+    if pct >= 100:
+        return t("bottle_100")
+    elif pct >= 75:
+        return t("bottle_75")
+    elif pct >= 50:
+        return t("bottle_50")
+    elif pct >= 25:
+        return t("bottle_25")
+    else:
+        return t("bottle_0")
 
 # ---------------------------------------------------------------
 # UI
 # ---------------------------------------------------------------
-st.set_page_config(page_title="Weight Loss Tracker", page_icon="💪", layout="centered")
-st.title("💪 Weight Loss Tracker")
+st.set_page_config(page_title="Momentum", page_icon="⚡", layout="centered")
 
-page = st.sidebar.radio("View", ["Today", "Weight Log", "Weekly Dashboard"])
-
+if "language" not in st.session_state:
+    st.session_state.language = get_setting("language", "English")
 if "selected_date" not in st.session_state:
     st.session_state.selected_date = date.today()
 
-if page == "Today":
+with st.sidebar:
+    lang_choice = st.selectbox(t("language_label"), LANGUAGES, index=LANGUAGES.index(st.session_state.language))
+    if lang_choice != st.session_state.language:
+        st.session_state.language = lang_choice
+        set_setting("language", lang_choice)
+        st.rerun()
+    st.caption("💡 Tip: use the ⋮ menu (top right) → Settings → Theme for light/dark mode.")
+    page = st.radio(
+        t("app_title"),
+        [t("nav_today"), t("nav_weight_log"), t("nav_weekly_dashboard"), t("nav_measurements"),
+         t("nav_photos"), t("nav_profile"), t("nav_settings")],
+        label_visibility="collapsed"
+    )
+
+TARGETS = load_targets()
+st.title(t("app_title"))
+
+if page == t("nav_today"):
     col1, col2, col3 = st.columns([1, 2, 1])
     with col1:
-        if st.button("⬅ Prev day"):
+        if st.button(t("prev_day")):
             st.session_state.selected_date -= timedelta(days=1)
     with col3:
-        if st.button("Next day ➡"):
+        if st.button(t("next_day")):
             st.session_state.selected_date += timedelta(days=1)
     with col2:
         picked = st.date_input("Date", value=st.session_state.selected_date, label_visibility="collapsed")
@@ -211,15 +966,23 @@ if page == "Today":
     day_plan = GYM_SPLIT[weekday]
 
     st.subheader(f"{weekday}, {log_date.strftime('%d %b %Y')}")
-    st.caption(f"Gym: **{day_plan['label']}**")
+    st.caption(f"{t('gym_label')}: **{day_plan['label']}**")
 
     row = get_daily_row(log_date_str)
 
-    # ---- Meals ----
-    st.markdown("### 🍽️ Meals")
+    streak, longest, total_days = compute_streak_stats()
+    badges = get_earned_badges(longest, total_days)
+    with st.expander(t("streak_header"), expanded=False):
+        s1, s2, s3 = st.columns(3)
+        s1.metric(t("current_streak_label"), f"{streak} 🔥")
+        s2.metric(t("longest_streak_label"), f"{longest}")
+        s3.metric(t("days_logged_label"), f"{total_days}")
+        if badges:
+            st.caption(f"{t('badges_label')}: " + " · ".join(badges))
+
+    st.markdown(f"### {t('meals_header')}")
     meal_state = get_meal_checks(log_date_str)
     meal_details = get_meal_details(log_date_str)
-
     day_calories_total = 0
     day_meal_protein_total = 0
 
@@ -228,128 +991,144 @@ if page == "Today":
         header = meal
         if details["note"]:
             header += f" — {details['note'][:30]}{'…' if len(details['note']) > 30 else ''}"
-
         with st.expander(header, expanded=False):
-            checked = st.checkbox("Done", value=meal_state[meal], key=f"meal_{log_date_str}_{meal}")
+            checked = st.checkbox(t("done_label"), value=meal_state[meal], key=f"meal_{log_date_str}_{meal}")
             if checked != meal_state[meal]:
                 set_meal_check(log_date_str, meal, checked)
-
-            note = st.text_input(
-                "What did you have?", value=details["note"], key=f"meal_note_{log_date_str}_{meal}"
-            )
-
+            if checked:
+                render_meal_stamp()
+            note = st.text_input(t("what_did_you_have"), value=details["note"], key=f"meal_note_{log_date_str}_{meal}")
             mc1, mc2 = st.columns(2)
             with mc1:
-                cals = st.number_input(
-                    "Calories", min_value=0.0, value=float(details["calories"]),
-                    step=10.0, key=f"meal_cal_{log_date_str}_{meal}"
-                )
+                cals = st.number_input(t("calories_label"), min_value=0.0, value=float(details["calories"]),
+                                        step=10.0, key=f"meal_cal_{log_date_str}_{meal}")
             with mc2:
-                prot = st.number_input(
-                    "Protein (g)", min_value=0.0, value=float(details["protein_g"]),
-                    step=1.0, key=f"meal_prot_{log_date_str}_{meal}"
-                )
-
+                prot = st.number_input(t("protein_label"), min_value=0.0, value=float(details["protein_g"]),
+                                        step=1.0, key=f"meal_prot_{log_date_str}_{meal}")
             if (note, cals, prot) != (details["note"], details["calories"], details["protein_g"]):
                 set_meal_detail(log_date_str, meal, note, cals, prot)
-
             day_calories_total += cals
             day_meal_protein_total += prot
 
     st.caption(
-        f"Meals logged today: {day_calories_total:.0f} kcal · {day_meal_protein_total:.0f}g protein "
-        f"(target {TARGETS['calories_min']}-{TARGETS['calories_max']} kcal, "
-        f"{TARGETS['protein_min']}-{TARGETS['protein_max']}g protein)"
+        f"{day_calories_total:.0f} kcal · {day_meal_protein_total:.0f}g "
+        f"(target {TARGETS['calories_min']:.0f}-{TARGETS['calories_max']:.0f} kcal, "
+        f"{TARGETS['protein_min']:.0f}-{TARGETS['protein_max']:.0f}g protein)"
     )
 
-    # ---- Workout ----
-    st.markdown(f"### 🏋️ Workout — {day_plan['label']}")
+    st.markdown(f"### {t('workout_header')} — {day_plan['label']}")
     ex_state = get_exercise_checks(log_date_str, day_plan["exercises"])
-    for ex in day_plan["exercises"]:
-        checked = st.checkbox(ex, value=ex_state[ex], key=f"ex_{log_date_str}_{ex}")
-        if checked != ex_state[ex]:
-            set_exercise_check(log_date_str, ex, checked)
 
-    # ---- Numbers: protein, water, steps ----
-    st.markdown("### 📊 Daily Numbers")
+    bottle_col, list_col = st.columns([1, 2])
+    with list_col:
+        for ex in day_plan["exercises"]:
+            checked = st.checkbox(ex, value=ex_state[ex], key=f"ex_{log_date_str}_{ex}")
+            if checked != ex_state[ex]:
+                set_exercise_check(log_date_str, ex, checked)
+                ex_state[ex] = checked
+    with bottle_col:
+        total_ex = len(day_plan["exercises"])
+        done_ex = sum(1 for ex in day_plan["exercises"] if ex_state[ex])
+        pct = (done_ex / total_ex * 100) if total_ex else 0
+        render_bottle(pct, get_bottle_message(pct))
+
+    # ---- Extra exercises (anything logged beyond today's fixed plan) ----
+    st.markdown(f"##### {t('extra_exercises_header')}")
+    all_logged = get_all_logged_exercises(log_date_str)
+    extra_names = [name for name in all_logged if name not in day_plan["exercises"]]
+
+    for name in extra_names:
+        ec1, ec2 = st.columns([5, 1])
+        with ec1:
+            checked = st.checkbox(name, value=bool(all_logged[name]), key=f"extra_{log_date_str}_{name}")
+            if checked != bool(all_logged[name]):
+                set_exercise_check(log_date_str, name, checked)
+        with ec2:
+            if st.button(t("delete_label"), key=f"extra_del_{log_date_str}_{name}"):
+                remove_exercise(log_date_str, name)
+                st.rerun()
+
+    new_extra_col1, new_extra_col2 = st.columns([4, 1])
+    with new_extra_col1:
+        new_extra_name = st.text_input(
+            t("add_extra_placeholder"), key=f"new_extra_{log_date_str}", label_visibility="collapsed",
+            placeholder=t("add_extra_placeholder")
+        )
+    with new_extra_col2:
+        if st.button(t("add_extra_button"), key=f"add_extra_btn_{log_date_str}"):
+            if new_extra_name.strip():
+                set_exercise_check(log_date_str, new_extra_name.strip(), True)
+                st.rerun()
+
+    st.markdown(f"### {t('daily_numbers_header')}")
     n1, n2, n3 = st.columns(3)
     with n1:
         protein = st.number_input(
-            f"Protein (g) — target {TARGETS['protein_min']}-{TARGETS['protein_max']}g",
-            min_value=0.0, value=float(row["protein_g"] or 0), step=5.0, key=f"protein_{log_date_str}"
-        )
-        if st.button("Use meal total", key=f"use_meal_protein_{log_date_str}"):
+            f"{t('protein_label')} — target {TARGETS['protein_min']:.0f}-{TARGETS['protein_max']:.0f}g",
+            min_value=0.0, value=float(row["protein_g"] or 0), step=5.0, key=f"protein_{log_date_str}")
+        if st.button(t("use_meal_total"), key=f"use_meal_protein_{log_date_str}"):
             protein = day_meal_protein_total
     with n2:
         water = st.number_input(
-            f"Water (L) — target {TARGETS['water_min']}-{TARGETS['water_max']}L",
-            min_value=0.0, value=float(row["water_l"] or 0), step=0.25, key=f"water_{log_date_str}"
-        )
+            f"{t('water_label')} — target {TARGETS['water_min']}-{TARGETS['water_max']}L",
+            min_value=0.0, value=float(row["water_l"] or 0), step=0.25, key=f"water_{log_date_str}")
     with n3:
         steps = st.number_input(
-            f"Steps — target {TARGETS['steps_min']:,}-{TARGETS['steps_max']:,}",
-            min_value=0, value=int(row["steps"] or 0), step=500, key=f"steps_{log_date_str}"
-        )
+            f"{t('steps_label')} — target {TARGETS['steps_min']:,.0f}-{TARGETS['steps_max']:,.0f}",
+            min_value=0, value=int(row["steps"] or 0), step=500, key=f"steps_{log_date_str}")
 
     st.progress(min(protein / TARGETS["protein_min"], 1.0) if TARGETS["protein_min"] else 0,
-                text=f"Protein: {protein:.0f}g / {TARGETS['protein_min']}g min")
+                text=f"{t('protein_label')}: {protein:.0f}g / {TARGETS['protein_min']:.0f}g min")
     st.progress(min(water / TARGETS["water_min"], 1.0) if TARGETS["water_min"] else 0,
-                text=f"Water: {water:.2f}L / {TARGETS['water_min']}L min")
+                text=f"{t('water_label')}: {water:.2f}L / {TARGETS['water_min']}L min")
     st.progress(min(steps / TARGETS["steps_min"], 1.0) if TARGETS["steps_min"] else 0,
-                text=f"Steps: {steps:,} / {TARGETS['steps_min']:,} min")
+                text=f"{t('steps_label')}: {steps:,} / {TARGETS['steps_min']:,.0f} min")
 
-    # ---- Weight ----
-    st.markdown("### ⚖️ Weight")
-    weight = st.number_input(
-        "Weight (kg) — optional, log on weigh-in days",
-        min_value=0.0, value=float(row["weight_kg"]) if row["weight_kg"] else 0.0,
-        step=0.1, key=f"weight_{log_date_str}"
-    )
+    st.markdown(f"### {t('weight_section_header')}")
+    weight = st.number_input(t("weight_label"), min_value=0.0,
+                              value=float(row["weight_kg"]) if row["weight_kg"] else 0.0,
+                              step=0.1, key=f"weight_{log_date_str}")
+    notes = st.text_area(t("notes_label"), value=row["notes"] or "", key=f"notes_{log_date_str}")
 
-    # ---- Notes ----
-    notes = st.text_area("Notes (optional)", value=row["notes"] or "", key=f"notes_{log_date_str}")
+    if st.button(t("save_button"), type="primary"):
+        save_daily_row(log_date_str, protein, water, steps, weight if weight > 0 else None, notes)
+        st.success(t("saved_msg"))
 
-    if st.button("💾 Save today's log", type="primary"):
-        save_daily_row(
-            log_date_str, protein, water, steps,
-            weight if weight > 0 else None, notes
-        )
-        st.success("Saved!")
-
-elif page == "Weight Log":
-    st.subheader("⚖️ Weight Trend")
+elif page == t("nav_weight_log"):
+    st.subheader(t("weight_trend_header"))
     end = date.today()
     start = end - timedelta(days=90)
     df = get_range_df(start, end)
     df = df.dropna(subset=["weight_kg"])
-
     if df.empty:
-        st.info("No weight entries yet. Log your weight on the Today page.")
+        st.info(t("no_weight_entries"))
     else:
         df["log_date"] = pd.to_datetime(df["log_date"])
         df = df.sort_values("log_date")
         df["trend"] = df["weight_kg"].rolling(window=7, min_periods=1).mean()
         chart_df = df.set_index("log_date")[["weight_kg", "trend"]]
-        chart_df.columns = ["Weight (kg)", "7-day trend"]
+        chart_df.columns = [t("weight_label"), "7-day trend"]
         st.line_chart(chart_df)
-
         c1, c2, c3 = st.columns(3)
-        c1.metric("Latest weight", f"{df['weight_kg'].iloc[-1]:.1f} kg")
+        with c1:
+            st.caption(t("latest_weight"))
+            render_animated_number(float(df['weight_kg'].iloc[-1]), suffix=" kg")
         if len(df) > 1:
             change = df["weight_kg"].iloc[-1] - df["weight_kg"].iloc[0]
-            c2.metric("Change (period)", f"{change:+.1f} kg")
-        c3.metric("Entries logged", len(df))
-
+            with c2:
+                st.caption(t("change_period"))
+                render_trend_arrow(change, unit="kg")
+        c3.metric(t("entries_logged"), len(df))
         st.dataframe(df[["log_date", "weight_kg"]].rename(
-            columns={"log_date": "Date", "weight_kg": "Weight (kg)"}
+            columns={"log_date": "Date", "weight_kg": t("weight_label")}
         ).sort_values("Date", ascending=False), hide_index=True, use_container_width=True)
 
-elif page == "Weekly Dashboard":
-    st.subheader("📅 Weekly Adherence")
+elif page == t("nav_weekly_dashboard"):
+    st.subheader(t("weekly_adherence_header"))
     today = date.today()
     start_of_week = today - timedelta(days=today.weekday())
     end_of_week = start_of_week + timedelta(days=6)
-    st.caption(f"Week of {start_of_week.strftime('%d %b')} – {end_of_week.strftime('%d %b %Y')}")
+    st.caption(f"{start_of_week.strftime('%d %b')} – {end_of_week.strftime('%d %b %Y')}")
 
     daily_df = get_range_df(start_of_week, end_of_week)
     meal_df = get_meal_completion_for_range(start_of_week, end_of_week)
@@ -364,43 +1143,176 @@ elif page == "Weekly Dashboard":
     summary = summary.merge(macro_df, on="log_date", how="left")
     summary = summary.fillna(0)
     summary["weekday"] = pd.to_datetime(summary["log_date"]).dt.strftime("%a")
-
+    # Force chronological order (Mon->Sun for this week) instead of the default alphabetical sort
+    weekday_order = summary["weekday"].tolist()
+    summary["weekday"] = pd.Categorical(summary["weekday"], categories=weekday_order, ordered=True)
     summary["meal_pct"] = (summary["meals_done"] / len(MEALS) * 100).clip(0, 100)
     summary["protein_hit"] = summary["protein_g"] >= TARGETS["protein_min"]
-    summary["water_hit"] = summary["water_l"] >= TARGETS["water_min"]
     summary["steps_hit"] = summary["steps"] >= TARGETS["steps_min"]
-    summary["calories_hit"] = (summary["calories_total"] >= TARGETS["calories_min"]) & \
-        (summary["calories_total"] <= TARGETS["calories_max"])
     summary["ex_pct"] = summary.apply(
-        lambda r: (r["ex_done"] / r["ex_total"] * 100) if r["ex_total"] > 0 else 0, axis=1
-    )
+        lambda r: (r["ex_done"] / r["ex_total"] * 100) if r["ex_total"] > 0 else 0, axis=1)
 
     m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Meals hit (avg)", f"{summary['meal_pct'].mean():.0f}%")
-    m2.metric("Workouts completed", f"{summary['ex_pct'].mean():.0f}%")
-    m3.metric("Protein target days", f"{int(summary['protein_hit'].sum())}/7")
-    m4.metric("Steps target days", f"{int(summary['steps_hit'].sum())}/7")
+    m1.metric(t("meals_hit_avg"), f"{summary['meal_pct'].mean():.0f}%")
+    m2.metric(t("workouts_completed"), f"{summary['ex_pct'].mean():.0f}%")
+    m3.metric(t("protein_target_days"), f"{int(summary['protein_hit'].sum())}/7")
+    m4.metric(t("steps_target_days"), f"{int(summary['steps_hit'].sum())}/7")
 
-    st.markdown("#### Meal completion by day")
-    st.bar_chart(summary.set_index("weekday")["meal_pct"])
+    st.markdown("#### " + t("meals_hit_avg").split(" (")[0])
+    render_animated_bars(summary["weekday"].astype(str).tolist(), summary["meal_pct"].tolist(), 100, "%")
 
-    st.markdown("#### Workout completion by day")
-    st.bar_chart(summary.set_index("weekday")["ex_pct"])
+    st.markdown("#### " + t("workouts_completed"))
+    render_animated_bars(summary["weekday"].astype(str).tolist(), summary["ex_pct"].tolist(), 100, "%")
 
-    st.markdown("#### Protein & Water vs target")
     pw_df = summary.set_index("weekday")[["protein_g", "water_l"]].copy()
-    pw_df.columns = ["Protein (g)", "Water (L)"]
+    pw_df.columns = [t("protein_label"), t("water_label")]
     st.line_chart(pw_df)
 
-    st.markdown("#### Calories from logged meals")
-    st.bar_chart(summary.set_index("weekday")["calories_total"])
+    cal_max = max(summary["calories_total"].max(), 1)
+    render_animated_bars(summary["weekday"].astype(str).tolist(), summary["calories_total"].tolist(), cal_max, "")
 
-    st.markdown("#### Raw log")
     display_cols = ["log_date", "protein_g", "water_l", "steps", "weight_kg", "meals_done",
                      "ex_done", "ex_total", "calories_total", "meal_protein_total"]
     st.dataframe(summary[display_cols].rename(columns={
-        "log_date": "Date", "protein_g": "Protein (g)", "water_l": "Water (L)",
-        "steps": "Steps", "weight_kg": "Weight (kg)", "meals_done": "Meals done",
+        "log_date": "Date", "protein_g": t("protein_label"), "water_l": t("water_label"),
+        "steps": t("steps_label"), "weight_kg": t("weight_label"), "meals_done": "Meals done",
         "ex_done": "Exercises done", "ex_total": "Exercises total",
-        "calories_total": "Calories (from meals)", "meal_protein_total": "Protein (from meals)"
+        "calories_total": "Calories", "meal_protein_total": "Protein (meals)"
     }), hide_index=True, use_container_width=True)
+
+elif page == t("nav_measurements"):
+    st.subheader(t("measurements_header"))
+    log_date = st.session_state.selected_date
+    log_date_str = log_date.isoformat()
+    m_row = get_measurement_row(log_date_str)
+    mc1, mc2 = st.columns(2)
+    all_m_prior = get_all_measurements()
+    all_m_prior = all_m_prior[all_m_prior["log_date"] != log_date_str]
+    prev_row = None
+    if not all_m_prior.empty:
+        prev_row = all_m_prior.sort_values("log_date").iloc[-1]
+
+    def delta_for(field):
+        if prev_row is None or pd.isna(prev_row[field]):
+            return None
+        cur_val = m_row[field]
+        if not cur_val:
+            return None
+        return float(cur_val) - float(prev_row[field])
+
+    with mc1:
+        waist = st.number_input(t("waist_label"), min_value=0.0, value=float(m_row["waist_cm"] or 0), step=0.5)
+        render_delta_badge(delta_for("waist_cm"))
+        chest = st.number_input(t("chest_label"), min_value=0.0, value=float(m_row["chest_cm"] or 0), step=0.5)
+        render_delta_badge(delta_for("chest_cm"))
+        hips = st.number_input(t("hips_label"), min_value=0.0, value=float(m_row["hips_cm"] or 0), step=0.5)
+        render_delta_badge(delta_for("hips_cm"))
+    with mc2:
+        arms = st.number_input(t("arms_label"), min_value=0.0, value=float(m_row["arms_cm"] or 0), step=0.5)
+        render_delta_badge(delta_for("arms_cm"))
+        thighs = st.number_input(t("thighs_label"), min_value=0.0, value=float(m_row["thighs_cm"] or 0), step=0.5)
+        render_delta_badge(delta_for("thighs_cm"))
+    if st.button(t("save_measurement"), type="primary"):
+        save_measurement(log_date_str, waist or None, chest or None, hips or None, arms or None, thighs or None)
+        st.success(t("saved_msg"))
+    all_m = get_all_measurements()
+    if not all_m.empty:
+        all_m["log_date"] = pd.to_datetime(all_m["log_date"])
+        all_m = all_m.sort_values("log_date").set_index("log_date")
+        chart_df = all_m[["waist_cm", "chest_cm", "hips_cm", "arms_cm", "thighs_cm"]].dropna(how="all")
+        if not chart_df.empty:
+            st.line_chart(chart_df)
+
+elif page == t("nav_photos"):
+    st.subheader(t("photos_header"))
+    log_date = st.session_state.selected_date
+    log_date_str = log_date.isoformat()
+    uploaded = st.file_uploader(t("upload_photo"), type=["png", "jpg", "jpeg"])
+    caption = st.text_input(t("caption_label"))
+    if uploaded is not None and st.button(t("save_photo"), type="primary"):
+        save_photo(log_date_str, caption, uploaded.getvalue())
+        st.success(t("saved_msg"))
+        st.rerun()
+    photos = get_all_photos()
+    if photos:
+        st.markdown(f"#### {t('compare_header')}")
+        options = {f"{p['log_date']} — {p['caption'] or 'no caption'} (#{p['id']})": p for p in photos}
+        choice_labels = list(options.keys())
+        c1, c2 = st.columns(2)
+        with c1:
+            pick1 = st.selectbox("A", choice_labels, key="photo_a")
+        with c2:
+            pick2 = st.selectbox("B", choice_labels, index=min(1, len(choice_labels) - 1), key="photo_b")
+        cc1, cc2 = st.columns(2)
+        with cc1:
+            st.caption(pick1)
+        with cc2:
+            st.caption(pick2)
+        p1, p2 = options[pick1], options[pick2]
+        render_compare_slider(bytes(p1["photo_data"]), bytes(p2["photo_data"]))
+        st.markdown("---")
+        for p in photos:
+            cols = st.columns([1, 3, 1])
+            with cols[0]:
+                st.image(bytes(p["photo_data"]), width=100)
+            with cols[1]:
+                st.caption(f"{p['log_date']} — {p['caption'] or ''}")
+            with cols[2]:
+                if st.button(t("delete_label"), key=f"del_photo_{p['id']}"):
+                    delete_photo(p["id"])
+                    st.rerun()
+
+elif page == t("nav_profile"):
+    st.subheader(t("profile_header"))
+    st.caption(t("profile_disclaimer"))
+    profile = get_profile()
+
+    p1, p2 = st.columns(2)
+    with p1:
+        goal = st.selectbox(t("goal_label"), GOALS, index=GOALS.index(profile["goal"]) if profile["goal"] in GOALS else 2)
+        height = st.number_input(t("height_label"), min_value=0.0, value=float(profile["height_cm"] or 0), step=0.5)
+        weight = st.number_input(t("current_weight_label"), min_value=0.0, value=float(profile["weight_kg"] or 0), step=0.1)
+        age = st.number_input(t("age_label"), min_value=0, value=int(profile["age"] or 0), step=1)
+    with p2:
+        sex = st.selectbox(t("sex_label"), SEX_OPTIONS, index=SEX_OPTIONS.index(profile["sex"]) if profile["sex"] in SEX_OPTIONS else 2)
+        country = st.text_input(t("country_label"), value=profile["country"] or "")
+        activity = st.selectbox(t("activity_label"), ACTIVITY_LEVELS,
+                                 index=ACTIVITY_LEVELS.index(profile["activity_level"]) if profile["activity_level"] in ACTIVITY_LEVELS else 2)
+
+    if st.button(t("recalc_button"), type="primary"):
+        save_profile(goal, height or None, weight or None, age or None, sex, country, activity)
+        new_targets = compute_targets_from_profile({
+            "height_cm": height, "weight_kg": weight, "age": age,
+            "sex": sex, "activity_level": activity, "goal": goal
+        })
+        if new_targets:
+            save_targets(new_targets)
+            st.success(t("targets_updated_msg"))
+        else:
+            st.success(t("saved_msg"))
+        st.rerun()
+
+elif page == t("nav_settings"):
+    st.subheader(t("settings_header"))
+    st.markdown(f"#### {t('edit_targets_header')}")
+    current = load_targets()
+    t1, t2 = st.columns(2)
+    with t1:
+        cal_min = st.number_input("Calories min", value=float(current["calories_min"]), step=50.0)
+        cal_max = st.number_input("Calories max", value=float(current["calories_max"]), step=50.0)
+        prot_min = st.number_input("Protein min (g)", value=float(current["protein_min"]), step=5.0)
+        prot_max = st.number_input("Protein max (g)", value=float(current["protein_max"]), step=5.0)
+    with t2:
+        water_min = st.number_input("Water min (L)", value=float(current["water_min"]), step=0.25)
+        water_max = st.number_input("Water max (L)", value=float(current["water_max"]), step=0.25)
+        steps_min = st.number_input("Steps min", value=float(current["steps_min"]), step=500.0)
+        steps_max = st.number_input("Steps max", value=float(current["steps_max"]), step=500.0)
+    if st.button(t("save_targets"), type="primary"):
+        save_targets({
+            "calories_min": cal_min, "calories_max": cal_max,
+            "protein_min": prot_min, "protein_max": prot_max,
+            "water_min": water_min, "water_max": water_max,
+            "steps_min": steps_min, "steps_max": steps_max,
+        })
+        st.success(t("saved_msg"))
+        st.rerun()
