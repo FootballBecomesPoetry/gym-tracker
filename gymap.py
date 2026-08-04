@@ -7,6 +7,12 @@ import plotly.express as px
 import base64
 from datetime import date, timedelta
 
+try:
+    import google.generativeai as genai
+    GEMINI_AVAILABLE = True
+except ImportError:
+    GEMINI_AVAILABLE = False
+
 # ---------------------------------------------------------------
 # CONFIG
 # ---------------------------------------------------------------
@@ -118,6 +124,11 @@ BASE_EN = {
     "advanced_trends_header": "📈 Advanced Trends (last 30 days)",
     "photo_timeline_header": "🕒 Photo Timeline",
     "prev_week": "⬅ Prev week", "next_week": "Next week ➡", "back_to_this_week": "Back to this week",
+    "nav_gym_bro": "🤖 Gym Bro", "gym_bro_header": "🤖 Gym Bro",
+    "gym_bro_intro": "Ask me anything about training, nutrition, or recovery.",
+    "gym_bro_placeholder": "Ask Gym Bro a question...",
+    "gym_bro_disclaimer": "Gym Bro gives general fitness/nutrition info, not medical advice. For injuries, pain, or health conditions, see a doctor.",
+    "gym_bro_missing_key": "Gym Bro needs a free Gemini API key to work. Add it in your secrets.toml — see the setup notes.",
 }
 
 BASE_AF = {
@@ -1001,6 +1012,111 @@ def get_daily_quote():
     return QUOTES[date.today().toordinal() % len(QUOTES)]
 
 # ---------------------------------------------------------------
+# GYM BRO (AI chatbot — free Gemini API)
+# ---------------------------------------------------------------
+GYM_BRO_SYSTEM_PROMPT = """You are "Gym Bro" — a friendly, knowledgeable fitness buddy inside the Momentum app.
+
+Scope: only answer questions about training, exercise technique, nutrition, recovery, sleep, hydration,
+supplements (general info, not dosing prescriptions), and general healthy habits. If asked about something
+unrelated, politely redirect back to fitness/health topics.
+
+Rules you always follow:
+- You are not a doctor. Never diagnose, never give specific dosing/medical treatment advice.
+- If someone describes an injury, sharp pain, chest pain, dizziness, or anything that sounds medically
+  concerning, tell them clearly to see a doctor or medical professional rather than trying to solve it yourself.
+- Keep answers practical, encouraging, and concise — a few short paragraphs or a bullet list, not an essay.
+- Use the person's profile/target context below if relevant, but don't force it into every answer.
+- Never claim certainty about individualized medical outcomes.
+"""
+
+def ask_gym_bro(user_message, chat_history, profile, targets):
+    if not GEMINI_AVAILABLE:
+        return "⚠️ The Gemini library isn't installed yet. Run `pip install google-generativeai` and add it to requirements.txt."
+
+    api_key = st.secrets.get("gemini", {}).get("api_key") if hasattr(st, "secrets") else None
+    if not api_key:
+        return None  # signals missing key to the caller
+
+    try:
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel("gemini-2.5-flash", system_instruction=GYM_BRO_SYSTEM_PROMPT)
+
+        context = (
+            f"[User context — goal: {profile.get('goal')}, activity level: {profile.get('activity_level')}, "
+            f"protein target: {targets.get('protein_min')}-{targets.get('protein_max')}g, "
+            f"step target: {targets.get('steps_min')}-{targets.get('steps_max')}]"
+        )
+
+        history_for_model = []
+        for role, text in chat_history[-10:]:
+            history_for_model.append({"role": "user" if role == "user" else "model", "parts": [text]})
+
+        chat = model.start_chat(history=history_for_model)
+        response = chat.send_message(f"{context}\n\nUser question: {user_message}")
+        return response.text
+    except Exception as e:
+        return f"⚠️ Gym Bro hit an error talking to Gemini: {e}"
+
+def render_gym_bro_widget():
+    """Floating chat bubble, available on every page."""
+    st.markdown("""
+    <style>
+    div[data-testid="stPopover"] {
+        position: fixed !important;
+        bottom: 28px !important;
+        right: 28px !important;
+        left: auto !important;
+        top: auto !important;
+        z-index: 999999 !important;
+        width: auto !important;
+    }
+    div[data-testid="stPopover"] > div {
+        position: static !important;
+    }
+    div[data-testid="stPopover"] button {
+        border-radius: 50% !important;
+        width: 64px !important;
+        height: 64px !important;
+        min-width: 64px !important;
+        font-size: 1.8rem !important;
+        background: linear-gradient(135deg, #3b82f6, #8b5cf6) !important;
+        color: white !important;
+        border: 2px solid rgba(255,255,255,0.25) !important;
+        box-shadow: 0 4px 16px rgba(0,0,0,0.45) !important;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
+    with st.popover("💪"):
+        st.markdown(f"**{t('gym_bro_header')}**")
+        st.caption(t("gym_bro_intro"))
+        st.caption(t("gym_bro_disclaimer"))
+
+        api_key_present = bool(st.secrets.get("gemini", {}).get("api_key")) if hasattr(st, "secrets") else False
+        if not api_key_present:
+            st.warning(t("gym_bro_missing_key"))
+
+        if "gym_bro_messages" not in st.session_state:
+            st.session_state.gym_bro_messages = []
+
+        chat_box = st.container(height=300)
+        with chat_box:
+            for role, text in st.session_state.gym_bro_messages:
+                with st.chat_message("user" if role == "user" else "assistant"):
+                    st.markdown(text)
+
+        user_input = st.chat_input(t("gym_bro_placeholder"), key="gym_bro_input")
+        if user_input:
+            st.session_state.gym_bro_messages.append(("user", user_input))
+            profile = get_profile()
+            with st.spinner("..."):
+                reply = ask_gym_bro(user_input, st.session_state.gym_bro_messages[:-1], profile, TARGETS)
+            if reply is None:
+                reply = t("gym_bro_missing_key")
+            st.session_state.gym_bro_messages.append(("assistant", reply))
+            st.rerun()
+
+# ---------------------------------------------------------------
 # WEIGHT PREDICTION
 # ---------------------------------------------------------------
 def compute_weight_prediction():
@@ -1300,6 +1416,7 @@ with st.sidebar:
 
 TARGETS = load_targets()
 st.title(t("app_title"))
+render_gym_bro_widget()
 
 if page == t("nav_home"):
     today = date.today()
