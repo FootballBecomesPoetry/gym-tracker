@@ -2,6 +2,8 @@ import streamlit as st
 import streamlit.components.v1 as components
 import psycopg2
 import pandas as pd
+import numpy as np
+import plotly.express as px
 import base64
 from datetime import date, timedelta
 
@@ -99,6 +101,23 @@ BASE_EN = {
     "extra_exercises_header": "➕ Extra (not in today's plan)",
     "add_extra_placeholder": "e.g. Extra push-ups, evening run...",
     "add_extra_button": "Add",
+    "nav_home": "Home", "nav_achievements": "Achievements",
+    "momentum_score_label": "⚡ Today's Momentum Score",
+    "coach_header": "🤖 Coach's Notes", "coach_tomorrow_focus": "Tomorrow, focus on:",
+    "achievements_header": "🥇 Achievements", "achievements_unlocked": "unlocked",
+    "lifetime_stats_header": "📊 Lifetime Stats", "personal_records_header": "🏅 Personal Records",
+    "prediction_header": "📈 Weight Prediction", "prediction_30": "Projected weight in 30 days",
+    "prediction_90": "Projected weight in 90 days", "prediction_insufficient": "Log a few more weight entries (at least 2, spread over time) to see a prediction.",
+    "perfect_day_header": "🏆 PERFECT DAY ACHIEVED", "perfect_day_sub": "Every target hit today. Incredible work.",
+    "quote_of_day_label": "💬 Quote of the Day", "next_badge_label": "Next Badge",
+    "todays_workout_label": "Today's Workout", "weekly_change_label": "Weekly Change",
+    "current_weight_home_label": "Current Weight", "lifetime_workouts_label": "Total Workouts",
+    "lifetime_steps_label": "Lifetime Steps", "lifetime_protein_label": "Lifetime Protein",
+    "lifetime_water_label": "Lifetime Water", "pr_max_steps_label": "Most Steps in a Day",
+    "pr_longest_streak_label": "Longest Streak", "pr_max_protein_label": "Highest Protein Day",
+    "advanced_trends_header": "📈 Advanced Trends (last 30 days)",
+    "photo_timeline_header": "🕒 Photo Timeline",
+    "prev_week": "⬅ Prev week", "next_week": "Next week ➡", "back_to_this_week": "Back to this week",
 }
 
 BASE_AF = {
@@ -429,20 +448,47 @@ def get_conn():
     cur.close()
     return conn
 
-conn = get_conn()
+def get_live_conn():
+    """Returns the cached connection, transparently reconnecting if Supabase closed it (e.g. idle timeout)."""
+    c = get_conn()
+    if c.closed:
+        get_conn.clear()
+        c = get_conn()
+    return c
+
+conn = get_live_conn()
 
 def run(query, params=()):
-    cur = conn.cursor()
-    cur.execute(query, params)
-    cur.close()
+    c = get_live_conn()
+    try:
+        cur = c.cursor()
+        cur.execute(query, params)
+        cur.close()
+    except (psycopg2.InterfaceError, psycopg2.OperationalError):
+        get_conn.clear()
+        c = get_live_conn()
+        cur = c.cursor()
+        cur.execute(query, params)
+        cur.close()
 
 def fetch(query, params=()):
-    cur = conn.cursor()
-    cur.execute(query, params)
-    cols = [d[0] for d in cur.description]
-    rows = cur.fetchall()
-    cur.close()
-    return cols, rows
+    c = get_live_conn()
+    try:
+        cur = c.cursor()
+        cur.execute(query, params)
+        cols = [d[0] for d in cur.description]
+        rows = cur.fetchall()
+        cur.close()
+        return cols, rows
+    except (psycopg2.InterfaceError, psycopg2.OperationalError):
+        get_conn.clear()
+        c = get_live_conn()
+        cur = c.cursor()
+        cur.execute(query, params)
+        cols = [d[0] for d in cur.description]
+        rows = cur.fetchall()
+        cur.close()
+        return cols, rows
 
 # ---------------------------------------------------------------
 # SETTINGS / TARGETS
@@ -582,22 +628,22 @@ def remove_exercise(log_date, exercise):
 
 def get_range_df(start, end):
     q = "SELECT * FROM daily_log WHERE log_date BETWEEN %s AND %s ORDER BY log_date"
-    return pd.read_sql_query(q, conn, params=(start.isoformat(), end.isoformat()))
+    return pd.read_sql_query(q, get_live_conn(), params=(start.isoformat(), end.isoformat()))
 
 def get_meal_completion_for_range(start, end):
     q = """SELECT log_date, SUM(done) as done_count FROM meal_checks
            WHERE log_date BETWEEN %s AND %s GROUP BY log_date"""
-    return pd.read_sql_query(q, conn, params=(start.isoformat(), end.isoformat()))
+    return pd.read_sql_query(q, get_live_conn(), params=(start.isoformat(), end.isoformat()))
 
 def get_exercise_completion_for_range(start, end):
     q = """SELECT log_date, COUNT(*) as total, SUM(done) as done_count FROM exercise_checks
            WHERE log_date BETWEEN %s AND %s GROUP BY log_date"""
-    return pd.read_sql_query(q, conn, params=(start.isoformat(), end.isoformat()))
+    return pd.read_sql_query(q, get_live_conn(), params=(start.isoformat(), end.isoformat()))
 
 def get_meal_macro_totals_for_range(start, end):
     q = """SELECT log_date, SUM(calories) as calories_total, SUM(protein_g) as meal_protein_total
            FROM meal_details WHERE log_date BETWEEN %s AND %s GROUP BY log_date"""
-    return pd.read_sql_query(q, conn, params=(start.isoformat(), end.isoformat()))
+    return pd.read_sql_query(q, get_live_conn(), params=(start.isoformat(), end.isoformat()))
 
 # ---------------------------------------------------------------
 # BODY MEASUREMENTS
@@ -617,7 +663,7 @@ def save_measurement(log_date, waist, chest, hips, arms, thighs):
         (log_date, waist, chest, hips, arms, thighs))
 
 def get_all_measurements():
-    return pd.read_sql_query("SELECT * FROM body_measurements ORDER BY log_date", conn)
+    return pd.read_sql_query("SELECT * FROM body_measurements ORDER BY log_date", get_live_conn())
 
 # ---------------------------------------------------------------
 # PROGRESS PHOTOS
@@ -688,6 +734,294 @@ def get_earned_badges(longest_streak, total_days):
     earned = [name for threshold, name in STREAK_BADGES if longest_streak >= threshold]
     earned += [name for threshold, name in DAYS_BADGES if total_days >= threshold]
     return earned
+
+# ---------------------------------------------------------------
+# MOMENTUM SCORE & PERFECT DAY
+# ---------------------------------------------------------------
+def fetch_daily_row_readonly(log_date):
+    """Like get_daily_row but never inserts a blank row — safe for scoring past/other dates."""
+    cols, rows = fetch("SELECT * FROM daily_log WHERE log_date = %s", (log_date,))
+    if not rows:
+        return {"protein_g": 0, "water_l": 0, "steps": 0, "weight_kg": None, "notes": ""}
+    return dict(zip(cols, rows[0]))
+
+def compute_momentum_score(log_date_str, weekday, targets):
+    row = fetch_daily_row_readonly(log_date_str)
+    meal_state = get_meal_checks(log_date_str)
+    day_plan = GYM_SPLIT[weekday]
+    ex_state = get_exercise_checks(log_date_str, day_plan["exercises"])
+
+    protein = row["protein_g"] or 0
+    water = row["water_l"] or 0
+    steps = row["steps"] or 0
+    meals_done = sum(1 for v in meal_state.values() if v)
+    ex_total = len(day_plan["exercises"])
+    ex_done = sum(1 for v in ex_state.values() if v)
+
+    protein_score = min(protein / targets["protein_min"], 1.0) * 25 if targets["protein_min"] else 0
+    water_score = min(water / targets["water_min"], 1.0) * 20 if targets["water_min"] else 0
+    steps_score = min(steps / targets["steps_min"], 1.0) * 20 if targets["steps_min"] else 0
+    meal_score = (meals_done / len(MEALS)) * 15 if MEALS else 0
+    workout_score = (ex_done / ex_total) * 20 if ex_total else 0
+
+    total = round(protein_score + water_score + steps_score + meal_score + workout_score)
+    return max(0, min(100, total))
+
+def get_perfect_day_status(log_date_str, weekday, targets):
+    row = fetch_daily_row_readonly(log_date_str)
+    meal_state = get_meal_checks(log_date_str)
+    day_plan = GYM_SPLIT[weekday]
+    ex_state = get_exercise_checks(log_date_str, day_plan["exercises"])
+
+    protein_hit = (row["protein_g"] or 0) >= targets["protein_min"]
+    water_hit = (row["water_l"] or 0) >= targets["water_min"]
+    steps_hit = (row["steps"] or 0) >= targets["steps_min"]
+    meals_hit = all(meal_state.values()) if meal_state else False
+    ex_hit = all(ex_state.values()) if ex_state else False
+
+    return protein_hit and water_hit and steps_hit and meals_hit and ex_hit
+
+def render_momentum_score_badge(score):
+    if score >= 80:
+        color = "#10b981"
+    elif score >= 50:
+        color = "#f59e0b"
+    else:
+        color = "#ef4444"
+    html = f"""
+    <style>
+    @keyframes scoreIn {{ 0% {{ transform: scale(0.8); opacity:0; }} 100% {{ transform: scale(1); opacity:1; }} }}
+    .score-box {{ animation: scoreIn 0.4s ease-out; text-align:center; padding:8px 0; }}
+    .score-num {{ font-size:2.4rem; font-weight:800; color:{color}; }}
+    </style>
+    <div class="score-box">
+      <div style="font-size:0.9rem; color:#888;">{t('momentum_score_label')}</div>
+      <div class="score-num">{score} / 100</div>
+    </div>
+    """
+    components.html(html, height=100)
+
+def render_perfect_day_celebration():
+    html = """
+    <script>
+    try {
+      const ctx = new (window.AudioContext || window.webkitAudioContext)();
+      const notes = [523.25, 659.25, 783.99, 1046.5];
+      notes.forEach((freq, i) => {
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.frequency.value = freq;
+        osc.type = 'sine';
+        gain.gain.setValueAtTime(0.15, ctx.currentTime + i*0.12);
+        gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + i*0.12 + 0.3);
+        osc.connect(gain); gain.connect(ctx.destination);
+        osc.start(ctx.currentTime + i*0.12);
+        osc.stop(ctx.currentTime + i*0.12 + 0.3);
+      });
+    } catch(e) {}
+    </script>
+    """
+    components.html(html, height=0)
+    render_confetti()
+    st.success(f"🏆 {t('perfect_day_header')} — {t('perfect_day_sub')}")
+
+# ---------------------------------------------------------------
+# LIFETIME STATS, PERSONAL RECORDS & ACHIEVEMENTS
+# ---------------------------------------------------------------
+def compute_perfect_days_count(targets):
+    cols, rows = fetch("""
+        SELECT d.log_date, COALESCE(d.protein_g,0) as protein_g, COALESCE(d.water_l,0) as water_l,
+               COALESCE(d.steps,0) as steps, COALESCE(m.done_count,0) as meals_done,
+               COALESCE(e.done_count,0) as ex_done
+        FROM daily_log d
+        LEFT JOIN (SELECT log_date, SUM(done) as done_count FROM meal_checks GROUP BY log_date) m
+            ON d.log_date = m.log_date
+        LEFT JOIN (SELECT log_date, SUM(done) as done_count FROM exercise_checks GROUP BY log_date) e
+            ON d.log_date = e.log_date
+    """)
+    df = pd.DataFrame(rows, columns=cols)
+    if df.empty:
+        return 0
+    count = 0
+    for _, r in df.iterrows():
+        try:
+            wd = WEEKDAY_NAMES[pd.to_datetime(r["log_date"]).weekday()]
+        except Exception:
+            continue
+        expected_ex = len(GYM_SPLIT[wd]["exercises"])
+        if (r["protein_g"] >= targets["protein_min"] and r["water_l"] >= targets["water_min"] and
+                r["steps"] >= targets["steps_min"] and r["meals_done"] >= len(MEALS) and
+                r["ex_done"] >= expected_ex):
+            count += 1
+    return count
+
+def get_lifetime_stats(targets):
+    cols, rows = fetch("""
+        SELECT COALESCE(SUM(steps),0), COALESCE(SUM(protein_g),0), COALESCE(SUM(water_l),0),
+               COALESCE(MAX(steps),0), COALESCE(MAX(protein_g),0),
+               COALESCE(SUM(CASE WHEN weight_kg IS NOT NULL AND weight_kg > 0 THEN 1 ELSE 0 END),0)
+        FROM daily_log
+    """)
+    lifetime_steps, lifetime_protein, lifetime_water, max_steps_day, max_protein_day, weight_entries = \
+        rows[0] if rows else (0, 0, 0, 0, 0, 0)
+
+    _, wo_rows = fetch("SELECT COUNT(*) FROM exercise_checks WHERE done=1")
+    total_workouts = wo_rows[0][0] if wo_rows else 0
+
+    _, meal_rows = fetch("SELECT COUNT(*) FROM meal_checks WHERE done=1")
+    total_meals = meal_rows[0][0] if meal_rows else 0
+
+    _, photo_rows = fetch("SELECT COUNT(*) FROM progress_photos")
+    total_photos = photo_rows[0][0] if photo_rows else 0
+
+    _, bfast_rows = fetch("SELECT COUNT(*) FROM meal_checks WHERE meal='Breakfast' AND done=1")
+    first_breakfast = (bfast_rows[0][0] if bfast_rows else 0) > 0
+
+    streak, longest, total_active_days = compute_streak_stats()
+    perfect_days = compute_perfect_days_count(targets)
+
+    return {
+        "lifetime_steps": lifetime_steps, "lifetime_protein": lifetime_protein,
+        "lifetime_water": lifetime_water, "max_steps_day": max_steps_day,
+        "max_protein_day": max_protein_day, "weight_entries": weight_entries,
+        "total_workouts": total_workouts, "total_meals": total_meals,
+        "total_photos": total_photos, "first_breakfast": first_breakfast,
+        "longest_streak": longest, "total_active_days": total_active_days,
+        "perfect_days": perfect_days,
+    }
+
+def _threshold_achievements(stat_key, icon, name_template, thresholds, fmt="{n}"):
+    out = []
+    for n in thresholds:
+        out.append({
+            "id": f"{stat_key}_{n}", "label": f"{icon} {name_template.format(n=fmt.format(n=n))}",
+            "check": (lambda stats, k=stat_key, nn=n: stats.get(k, 0) >= nn)
+        })
+    return out
+
+ACHIEVEMENT_DEFS = (
+    _threshold_achievements("longest_streak", "🔥", "{n} Day Streak", [3, 7, 14, 30, 60, 100, 180, 365])
+    + _threshold_achievements("total_active_days", "📅", "{n} Days Logged", [5, 10, 25, 50, 100, 200, 365])
+    + _threshold_achievements("total_workouts", "🏋️", "{n} Workouts Completed", [1, 10, 25, 50, 100, 200, 365])
+    + _threshold_achievements("lifetime_steps", "🚶", "{n} Lifetime Steps", [10000, 50000, 100000, 250000, 500000, 1000000], fmt="{n:,}")
+    + _threshold_achievements("lifetime_water", "💧", "{n}L Lifetime Water", [10, 50, 100, 250, 500])
+    + [
+        {"id": f"protein_kg_{n}", "label": f"🍗 {n}kg Lifetime Protein",
+         "check": (lambda stats, nn=n: stats.get("lifetime_protein", 0) / 1000 >= nn)}
+        for n in [1, 5, 10, 25, 50]
+    ]
+    + _threshold_achievements("total_meals", "🍽️", "{n} Meals Logged", [10, 50, 100, 250, 500])
+    + _threshold_achievements("total_photos", "📸", "{n} Photos Uploaded", [1, 5, 10, 25])
+    + _threshold_achievements("perfect_days", "⚡", "{n} Perfect Days", [1, 5, 10, 25, 50])
+    + [
+        {"id": "first_breakfast", "label": "🥚 First Breakfast Logged", "check": lambda s: s.get("first_breakfast", False)},
+        {"id": "first_workout", "label": "💪 First Workout", "check": lambda s: s.get("total_workouts", 0) >= 1},
+        {"id": "first_photo", "label": "📸 First Progress Photo", "check": lambda s: s.get("total_photos", 0) >= 1},
+        {"id": "first_meal", "label": "🍴 First Meal Logged", "check": lambda s: s.get("total_meals", 0) >= 1},
+        {"id": "first_perfect_day", "label": "⚡ First Perfect Day", "check": lambda s: s.get("perfect_days", 0) >= 1},
+        {"id": "first_weight", "label": "⚖️ First Weight Logged", "check": lambda s: s.get("weight_entries", 0) >= 1},
+    ]
+)
+
+def get_achievement_status(stats):
+    return [(a["id"], a["label"], a["check"](stats)) for a in ACHIEVEMENT_DEFS]
+
+def get_next_streak_badge(current_streak):
+    for threshold, name in STREAK_BADGES:
+        if current_streak < threshold:
+            return name, current_streak, threshold
+    return None, current_streak, None
+
+# ---------------------------------------------------------------
+# DAILY COACH (rule-based, no external API)
+# ---------------------------------------------------------------
+def generate_coach_notes(log_date_str, weekday, targets):
+    row = fetch_daily_row_readonly(log_date_str)
+    meal_state = get_meal_checks(log_date_str)
+    day_plan = GYM_SPLIT[weekday]
+    ex_state = get_exercise_checks(log_date_str, day_plan["exercises"])
+
+    protein = row["protein_g"] or 0
+    water = row["water_l"] or 0
+    steps = row["steps"] or 0
+    meals_done = sum(1 for v in meal_state.values() if v)
+    ex_done = sum(1 for v in ex_state.values() if v)
+    ex_total = len(day_plan["exercises"])
+
+    lines, focus = [], []
+
+    if protein >= targets["protein_min"]:
+        lines.append("✅ Protein target hit")
+    else:
+        lines.append(f"⚠️ Protein low ({protein:.0f}g / {targets['protein_min']:.0f}g)")
+        focus.append(f"Get protein up to at least {targets['protein_min']:.0f}g")
+
+    if water >= targets["water_min"]:
+        lines.append("✅ Water target hit")
+    else:
+        lines.append(f"⚠️ Water low ({water:.1f}L / {targets['water_min']}L)")
+        focus.append(f"Drink {targets['water_min'] - water:.1f}L more water")
+
+    if steps >= targets["steps_min"]:
+        lines.append("✅ Steps target hit")
+    else:
+        lines.append(f"⚠️ Steps below target ({steps:,} / {targets['steps_min']:,.0f})")
+        focus.append(f"Aim for {targets['steps_min']:,.0f} steps")
+
+    if meals_done >= len(MEALS):
+        lines.append("✅ All meals logged")
+    else:
+        lines.append(f"⚠️ Only {meals_done}/{len(MEALS)} meals logged")
+
+    if ex_total and ex_done >= ex_total:
+        lines.append("✅ Workout completed")
+    elif ex_total:
+        lines.append(f"⚠️ Workout incomplete ({ex_done}/{ex_total})")
+        focus.append("Finish today's workout")
+
+    if not focus:
+        focus.append("Keep doing exactly what you're doing 🔥")
+
+    return lines, focus
+
+QUOTES = [
+    "Discipline is choosing between what you want now and what you want most.",
+    "Small steps every day lead to big results over time.",
+    "You don't have to be extreme, just consistent.",
+    "The only bad workout is the one that didn't happen.",
+    "Progress, not perfection.",
+    "Your future self is watching you right now through memories.",
+    "Motivation gets you started. Habit keeps you going.",
+    "Every rep counts, every meal matters, every day adds up.",
+    "The body achieves what the mind believes.",
+    "Consistency beats intensity every single time.",
+]
+
+def get_daily_quote():
+    return QUOTES[date.today().toordinal() % len(QUOTES)]
+
+# ---------------------------------------------------------------
+# WEIGHT PREDICTION
+# ---------------------------------------------------------------
+def compute_weight_prediction():
+    df = get_range_df(date.today() - timedelta(days=180), date.today())
+    df = df.dropna(subset=["weight_kg"])
+    if len(df) < 2:
+        return None
+    df["log_date"] = pd.to_datetime(df["log_date"])
+    df = df.sort_values("log_date")
+    span_days = (df["log_date"].iloc[-1] - df["log_date"].iloc[0]).days
+    if span_days < 7:
+        return None
+
+    x = df["log_date"].map(pd.Timestamp.toordinal).to_numpy()
+    y = df["weight_kg"].to_numpy()
+    slope, intercept = np.polyfit(x, y, 1)
+
+    today_ord = date.today().toordinal()
+    pred_30 = slope * (today_ord + 30) + intercept
+    pred_90 = slope * (today_ord + 90) + intercept
+    return {"current": float(y[-1]), "pred_30": float(pred_30), "pred_90": float(pred_90)}
 
 # ---------------------------------------------------------------
 # BOTTLE ANIMATION
@@ -868,6 +1202,25 @@ def render_compare_slider(bytes_a, bytes_b):
     """
     components.html(html, height=420)
 
+def render_timeline_visual(dates):
+    dots = ""
+    n = len(dates)
+    for i, d in enumerate(dates):
+        dots += f"""
+        <div style="display:flex; flex-direction:column; align-items:center; flex:1; min-width:60px;">
+          <div style="width:14px;height:14px;border-radius:50%;background:#3b82f6;
+                      border:2px solid white; box-shadow:0 0 0 2px #3b82f6;"></div>
+          <div style="font-size:0.65rem; margin-top:4px; text-align:center; color:#888;">{d}</div>
+        </div>
+        """
+    line_style = "flex:1; height:2px; background:#93a3b8; margin-top:6px;"
+    html = f"""
+    <div style="display:flex; align-items:flex-start; padding:10px 0; overflow-x:auto;">
+      {dots}
+    </div>
+    """
+    components.html(html, height=70)
+
 def render_bottle(pct, message):
     pct = max(0, min(100, pct))
     glow_style = ""
@@ -940,15 +1293,56 @@ with st.sidebar:
     st.caption("💡 Tip: use the ⋮ menu (top right) → Settings → Theme for light/dark mode.")
     page = st.radio(
         t("app_title"),
-        [t("nav_today"), t("nav_weight_log"), t("nav_weekly_dashboard"), t("nav_measurements"),
-         t("nav_photos"), t("nav_profile"), t("nav_settings")],
+        [t("nav_home"), t("nav_today"), t("nav_weight_log"), t("nav_weekly_dashboard"), t("nav_measurements"),
+         t("nav_photos"), t("nav_achievements"), t("nav_profile"), t("nav_settings")],
         label_visibility="collapsed"
     )
 
 TARGETS = load_targets()
 st.title(t("app_title"))
 
-if page == t("nav_today"):
+if page == t("nav_home"):
+    today = date.today()
+    today_str = today.isoformat()
+    weekday = WEEKDAY_NAMES[today.weekday()]
+    day_plan = GYM_SPLIT[weekday]
+
+    streak, longest, total_days = compute_streak_stats()
+    score = compute_momentum_score(today_str, weekday, TARGETS)
+
+    st.caption(t("quote_of_day_label"))
+    st.markdown(f"*{get_daily_quote()}*")
+
+    h1, h2 = st.columns(2)
+    with h1:
+        render_momentum_score_badge(score)
+    with h2:
+        st.metric(t("current_streak_label"), f"{streak} 🔥")
+
+    latest_weight_df = get_range_df(today - timedelta(days=90), today).dropna(subset=["weight_kg"])
+    hw1, hw2, hw3 = st.columns(3)
+    with hw1:
+        if not latest_weight_df.empty:
+            hw1.metric(t("current_weight_home_label"), f"{latest_weight_df['weight_kg'].iloc[-1]:.1f} kg")
+        else:
+            hw1.metric(t("current_weight_home_label"), "—")
+    with hw2:
+        week_ago_df = latest_weight_df[pd.to_datetime(latest_weight_df["log_date"]) <= pd.Timestamp(today - timedelta(days=7))]
+        if not latest_weight_df.empty and not week_ago_df.empty:
+            change = latest_weight_df["weight_kg"].iloc[-1] - week_ago_df["weight_kg"].iloc[-1]
+            hw2.metric(t("weekly_change_label"), f"{change:+.1f} kg")
+        else:
+            hw2.metric(t("weekly_change_label"), "—")
+    with hw3:
+        hw3.metric(t("todays_workout_label"), day_plan["label"])
+
+    next_name, current, threshold = get_next_streak_badge(longest)
+    if next_name:
+        st.caption(f"{t('next_badge_label')}: {next_name} ({current}/{threshold})")
+    else:
+        st.caption(f"{t('next_badge_label')}: 🏅 All streak badges unlocked!")
+
+elif page == t("nav_today"):
     col1, col2, col3 = st.columns([1, 2, 1])
     with col1:
         if st.button(t("prev_day")):
@@ -979,6 +1373,20 @@ if page == t("nav_today"):
         s3.metric(t("days_logged_label"), f"{total_days}")
         if badges:
             st.caption(f"{t('badges_label')}: " + " · ".join(badges))
+
+    score = compute_momentum_score(log_date_str, weekday, TARGETS)
+    render_momentum_score_badge(score)
+
+    if get_perfect_day_status(log_date_str, weekday, TARGETS):
+        render_perfect_day_celebration()
+
+    with st.expander(t("coach_header"), expanded=False):
+        coach_lines, coach_focus = generate_coach_notes(log_date_str, weekday, TARGETS)
+        for line in coach_lines:
+            st.write(line)
+        st.markdown(f"**{t('coach_tomorrow_focus')}**")
+        for f in coach_focus:
+            st.write(f"• {f}")
 
     st.markdown(f"### {t('meals_header')}")
     meal_state = get_meal_checks(log_date_str)
@@ -1123,10 +1531,36 @@ elif page == t("nav_weight_log"):
             columns={"log_date": "Date", "weight_kg": t("weight_label")}
         ).sort_values("Date", ascending=False), hide_index=True, use_container_width=True)
 
+    st.markdown(f"#### {t('prediction_header')}")
+    prediction = compute_weight_prediction()
+    if prediction:
+        pr1, pr2 = st.columns(2)
+        pr1.metric(t("prediction_30"), f"{prediction['pred_30']:.1f} kg")
+        pr2.metric(t("prediction_90"), f"{prediction['pred_90']:.1f} kg")
+        st.caption("Based on your current weight trend — a simple linear projection, not a guarantee.")
+    else:
+        st.info(t("prediction_insufficient"))
+
 elif page == t("nav_weekly_dashboard"):
     st.subheader(t("weekly_adherence_header"))
+
+    if "week_offset" not in st.session_state:
+        st.session_state.week_offset = 0
+
+    wcol1, wcol2, wcol3 = st.columns([1, 2, 1])
+    with wcol1:
+        if st.button(t("prev_week"), key="prev_week_btn"):
+            st.session_state.week_offset -= 1
+    with wcol3:
+        if st.button(t("next_week"), key="next_week_btn"):
+            st.session_state.week_offset += 1
+    with wcol2:
+        if st.session_state.week_offset != 0:
+            if st.button(t("back_to_this_week"), key="reset_week_btn"):
+                st.session_state.week_offset = 0
+
     today = date.today()
-    start_of_week = today - timedelta(days=today.weekday())
+    start_of_week = today - timedelta(days=today.weekday()) + timedelta(weeks=st.session_state.week_offset)
     end_of_week = start_of_week + timedelta(days=6)
     st.caption(f"{start_of_week.strftime('%d %b')} – {end_of_week.strftime('%d %b %Y')}")
 
@@ -1179,6 +1613,47 @@ elif page == t("nav_weekly_dashboard"):
         "ex_done": "Exercises done", "ex_total": "Exercises total",
         "calories_total": "Calories", "meal_protein_total": "Protein (meals)"
     }), hide_index=True, use_container_width=True)
+
+    with st.expander(t("advanced_trends_header"), expanded=False):
+        end30 = date.today()
+        start30 = end30 - timedelta(days=30)
+        daily30 = get_range_df(start30, end30)
+        macro30 = get_meal_macro_totals_for_range(start30, end30)
+        ex30 = get_exercise_completion_for_range(start30, end30)
+
+        all_days30 = [(start30 + timedelta(days=i)).isoformat() for i in range(31)]
+        s30 = pd.DataFrame({"log_date": all_days30})
+        s30 = s30.merge(daily30, on="log_date", how="left")
+        s30 = s30.merge(macro30, on="log_date", how="left")
+        s30 = s30.merge(ex30.rename(columns={"done_count": "ex_done", "total": "ex_total"}), on="log_date", how="left")
+        s30 = s30.fillna(0)
+        s30["log_date"] = pd.to_datetime(s30["log_date"])
+        s30 = s30.sort_values("log_date")
+        s30["calories_roll7"] = s30["calories_total"].rolling(7, min_periods=1).mean()
+        s30["protein_roll7"] = s30["protein_g"].rolling(7, min_periods=1).mean()
+        s30["steps_roll7"] = s30["steps"].rolling(7, min_periods=1).mean()
+        s30["ex_pct"] = s30.apply(lambda r: (r["ex_done"] / r["ex_total"] * 100) if r["ex_total"] > 0 else 0, axis=1)
+        s30["compliance_roll7"] = s30["ex_pct"].rolling(7, min_periods=1).mean()
+
+        weight30 = get_range_df(start30, end30).dropna(subset=["weight_kg"])
+        if not weight30.empty:
+            weight30["log_date"] = pd.to_datetime(weight30["log_date"])
+            weight30 = weight30.sort_values("log_date")
+            weight30["weight_roll7"] = weight30["weight_kg"].rolling(7, min_periods=1).mean()
+            fig_w = px.line(weight30, x="log_date", y="weight_roll7", title="7-Day Rolling Avg — Weight (kg)")
+            st.plotly_chart(fig_w, use_container_width=True)
+
+        fig_cal = px.line(s30, x="log_date", y="calories_roll7", title="7-Day Rolling Avg — Calories")
+        st.plotly_chart(fig_cal, use_container_width=True)
+
+        fig_prot = px.line(s30, x="log_date", y="protein_roll7", title="7-Day Rolling Avg — Protein (g)")
+        st.plotly_chart(fig_prot, use_container_width=True)
+
+        fig_steps = px.line(s30, x="log_date", y="steps_roll7", title="7-Day Rolling Avg — Steps")
+        st.plotly_chart(fig_steps, use_container_width=True)
+
+        fig_comp = px.line(s30, x="log_date", y="compliance_roll7", title="7-Day Rolling Avg — Workout Compliance %")
+        st.plotly_chart(fig_comp, use_container_width=True)
 
 elif page == t("nav_measurements"):
     st.subheader(t("measurements_header"))
@@ -1235,6 +1710,23 @@ elif page == t("nav_photos"):
         st.rerun()
     photos = get_all_photos()
     if photos:
+        st.markdown(f"#### {t('photo_timeline_header')}")
+        sorted_photos = sorted(photos, key=lambda p: p["log_date"])
+        timeline_dates = [p["log_date"] for p in sorted_photos]
+        render_timeline_visual(timeline_dates)
+
+        timeline_labels = {f"{p['log_date']} — {p['caption'] or 'no caption'}": p for p in sorted_photos}
+        selected_label = st.selectbox("View details for:", list(timeline_labels.keys()), index=len(timeline_labels) - 1)
+        selected_photo = timeline_labels[selected_label]
+
+        detail_row = fetch_daily_row_readonly(selected_photo["log_date"])
+        detail_measurements = get_measurement_row(selected_photo["log_date"])
+        td1, td2, td3 = st.columns(3)
+        td1.metric(t("weight_label"), f"{detail_row['weight_kg']:.1f} kg" if detail_row.get("weight_kg") else "—")
+        td2.metric(t("waist_label"), f"{detail_measurements['waist_cm']:.1f}" if detail_measurements.get("waist_cm") else "—")
+        td3.caption(f"💬 {selected_photo['caption'] or '—'}")
+        st.image(bytes(selected_photo["photo_data"]), width=250)
+
         st.markdown(f"#### {t('compare_header')}")
         options = {f"{p['log_date']} — {p['caption'] or 'no caption'} (#{p['id']})": p for p in photos}
         choice_labels = list(options.keys())
@@ -1261,6 +1753,36 @@ elif page == t("nav_photos"):
                 if st.button(t("delete_label"), key=f"del_photo_{p['id']}"):
                     delete_photo(p["id"])
                     st.rerun()
+
+elif page == t("nav_achievements"):
+    st.subheader(t("achievements_header"))
+    stats = get_lifetime_stats(TARGETS)
+    achievements = get_achievement_status(stats)
+    unlocked = [a for a in achievements if a[2]]
+    st.caption(f"{len(unlocked)}/{len(achievements)} {t('achievements_unlocked')}")
+    st.progress(len(unlocked) / len(achievements) if achievements else 0)
+
+    cols = st.columns(2)
+    for i, (aid, label, done) in enumerate(achievements):
+        with cols[i % 2]:
+            if done:
+                st.markdown(f"✅ {label}")
+            else:
+                st.markdown(f"<span style='color:#999;'>🔒 {label}</span>", unsafe_allow_html=True)
+
+    st.markdown("---")
+    st.markdown(f"#### {t('lifetime_stats_header')}")
+    l1, l2, l3, l4 = st.columns(4)
+    l1.metric(t("lifetime_workouts_label"), f"{stats['total_workouts']:,}")
+    l2.metric(t("lifetime_steps_label"), f"{stats['lifetime_steps']:,.0f}")
+    l3.metric(t("lifetime_protein_label"), f"{stats['lifetime_protein']:,.0f}g")
+    l4.metric(t("lifetime_water_label"), f"{stats['lifetime_water']:,.1f}L")
+
+    st.markdown(f"#### {t('personal_records_header')}")
+    p1, p2, p3 = st.columns(3)
+    p1.metric(t("pr_max_steps_label"), f"{stats['max_steps_day']:,.0f}")
+    p2.metric(t("pr_longest_streak_label"), f"{stats['longest_streak']} days")
+    p3.metric(t("pr_max_protein_label"), f"{stats['max_protein_day']:,.0f}g")
 
 elif page == t("nav_profile"):
     st.subheader(t("profile_header"))
