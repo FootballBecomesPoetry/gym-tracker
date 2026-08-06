@@ -1,3 +1,5 @@
+import re
+import requests
 import streamlit as st
 import streamlit.components.v1 as components
 import psycopg2
@@ -7,11 +9,9 @@ import plotly.express as px
 import base64
 from datetime import date, timedelta
 
-try:
-    import google.generativeai as genai
-    GEMINI_AVAILABLE = True
-except ImportError:
-    GEMINI_AVAILABLE = False
+# NOTE: we no longer use the google-generativeai SDK. Gym Bro now calls the
+# Gemini REST endpoint directly with `requests` (see ask_gym_bro below), which
+# avoids the SDK's OAuth/ADC fallback that caused the 401 error.
 
 # ---------------------------------------------------------------
 # CONFIG
@@ -66,6 +66,279 @@ ACTIVITY_MULTIPLIERS = {
     "Very active (physical job + training)": 1.9,
 }
 SEX_OPTIONS = ["Male", "Female", "Prefer not to say"]
+
+# ---------------------------------------------------------------
+# EXERCISE INFO (demo images / muscles / form cues)
+# ---------------------------------------------------------------
+# Images come from https://github.com/yuhonas/free-exercise-db — public domain
+# (Unlicense), hotlinked straight from raw.githubusercontent.com, no API key.
+# I verified these URLs return HTTP 200.
+#
+# Honest caveat: these are TWO STATIC PHOTOS per exercise (start position and
+# end position) shown side by side, not a looping animated GIF. I looked for a
+# free, reliably-hotlinkable source of real demo GIFs covering this exercise
+# list and couldn't find one I'd trust not to break or have licensing issues.
+# The two-frame version still shows the movement clearly.
+#
+# To upgrade to real GIFs later: just replace the URLs in any "images" list
+# below with your GIF URL(s). The renderer handles any number of URLs and
+# st.image() plays animated GIFs natively.
+
+# Canonical muscle regions used by the weekly muscle-volume heatmap. The
+# "muscles" strings in EXERCISE_INFO are human-readable; this maps them onto a
+# fixed set of regions so volume can be summed per region.
+MUSCLE_REGIONS = ["Chest", "Back", "Shoulders", "Biceps", "Triceps",
+                  "Core", "Quads", "Hamstrings", "Glutes", "Calves"]
+
+_MUSCLE_ALIASES = {
+    "chest": "Chest", "upper chest": "Chest",
+    "lats": "Back", "rhomboids": "Back", "upper back": "Back",
+    "lower back": "Back", "traps": "Back",
+    "shoulders": "Shoulders", "front shoulders": "Shoulders",
+    "side shoulders": "Shoulders", "rear shoulders": "Shoulders",
+    "rotator cuff": "Shoulders",
+    "biceps": "Biceps", "forearms": "Biceps",
+    "triceps": "Triceps",
+    "core": "Core", "core / abdominals": "Core", "abdominals": "Core",
+    "quads": "Quads",
+    "hamstrings": "Hamstrings",
+    "glutes": "Glutes",
+    "calves": "Calves",
+}
+
+
+def muscle_regions_for(exercise_name):
+    """Map an exercise to a list of canonical muscle regions (may be empty)."""
+    info = EXERCISE_INFO.get(base_exercise_name(exercise_name))
+    if not info:
+        return []
+    out = []
+    for m in info.get("muscles", []):
+        region = _MUSCLE_ALIASES.get(m.strip().lower())
+        if region and region not in out:
+            out.append(region)
+    return out
+
+
+def estimated_1rm(weight_kg, reps):
+    """Epley formula. A rough estimate, useful for trend-spotting, not a max test."""
+    if not weight_kg or not reps or reps < 1:
+        return 0.0
+    return float(weight_kg) * (1 + reps / 30.0)
+
+_FEDB = "https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/"
+
+EXERCISE_INFO = {
+    "Bench Press": {
+        "muscles": ["Chest", "Front Shoulders", "Triceps"],
+        "cues": ["Retract shoulder blades and keep them pinned", "Feet flat and driving into the floor",
+                 "Lower the bar to mid-chest with control", "Press up and slightly back over your face"],
+        "images": [_FEDB + "Barbell_Bench_Press_-_Medium_Grip/0.jpg", _FEDB + "Barbell_Bench_Press_-_Medium_Grip/1.jpg"],
+    },
+    "Incline DB Press": {
+        "muscles": ["Upper Chest", "Front Shoulders", "Triceps"],
+        "cues": ["Bench at a 30-45° incline", "Keep wrists stacked over elbows",
+                 "Lower dumbbells to chest level with control", "Avoid flaring elbows past 45°"],
+        "images": [_FEDB + "Incline_Dumbbell_Press/0.jpg", _FEDB + "Incline_Dumbbell_Press/1.jpg"],
+    },
+    "Shoulder Press": {
+        "muscles": ["Shoulders", "Triceps", "Upper Chest"],
+        "cues": ["Brace your core, avoid over-arching the lower back", "Press straight overhead, not forward",
+                 "Full lockout at the top without shrugging"],
+        "images": [_FEDB + "Dumbbell_Shoulder_Press/0.jpg", _FEDB + "Dumbbell_Shoulder_Press/1.jpg"],
+    },
+    "Lateral Raise": {
+        "muscles": ["Side Shoulders"],
+        "cues": ["Slight bend in the elbows throughout", "Lead with the elbows, not the hands",
+                 "Raise to roughly shoulder height", "Control the descent — don't swing"],
+        "images": [_FEDB + "Side_Lateral_Raise/0.jpg", _FEDB + "Side_Lateral_Raise/1.jpg"],
+    },
+    "Cable Fly": {
+        "muscles": ["Chest"],
+        "cues": ["Slight forward lean, chest up", "Soft bend in the elbows",
+                 "Squeeze at the midline, don't just swing the arms", "Control the stretch back out"],
+        "images": [_FEDB + "Cable_Crossover/0.jpg", _FEDB + "Cable_Crossover/1.jpg"],
+    },
+    "Triceps": {
+        "muscles": ["Triceps"],
+        "cues": ["Keep elbows tucked and stationary", "Full extension at the bottom",
+                 "Control the eccentric (lowering) portion"],
+        "images": [_FEDB + "Triceps_Pushdown/0.jpg", _FEDB + "Triceps_Pushdown/1.jpg"],
+    },
+    "Deadlift": {
+        "muscles": ["Hamstrings", "Glutes", "Lower Back", "Lats", "Traps"],
+        "cues": ["Bar over mid-foot to start", "Flat back — brace before you pull",
+                 "Push the floor away rather than yanking the bar", "Hips and shoulders rise together"],
+        "images": [_FEDB + "Barbell_Deadlift/0.jpg", _FEDB + "Barbell_Deadlift/1.jpg"],
+    },
+    "Lat Pulldown": {
+        "muscles": ["Lats", "Biceps", "Rear Shoulders"],
+        "cues": ["Slight lean back, chest up", "Pull elbows down and back",
+                 "Bring the bar to upper chest", "Control the return, don't let it snap up"],
+        "images": [_FEDB + "Wide-Grip_Lat_Pulldown/0.jpg", _FEDB + "Wide-Grip_Lat_Pulldown/1.jpg"],
+    },
+    "Rows": {
+        "muscles": ["Lats", "Rhomboids", "Rear Shoulders", "Biceps"],
+        "cues": ["Flat back, hinge at the hips", "Pull elbows back, squeeze shoulder blades",
+                 "Avoid using momentum to heave the weight"],
+        "images": [_FEDB + "Bent_Over_Barbell_Row/0.jpg", _FEDB + "Bent_Over_Barbell_Row/1.jpg"],
+    },
+    "Face Pulls": {
+        "muscles": ["Rear Shoulders", "Upper Back", "Rotator Cuff"],
+        "cues": ["Pull to eye level", "Lead with the elbows high",
+                 "Externally rotate at the end range", "Light weight, controlled tempo"],
+        "images": [_FEDB + "Face_Pull/0.jpg", _FEDB + "Face_Pull/1.jpg"],
+    },
+    "Curls": {
+        "muscles": ["Biceps"],
+        "cues": ["Elbows pinned at your sides", "No swinging — control the weight",
+                 "Full range of motion, squeeze at the top"],
+        "images": [_FEDB + "Barbell_Curl/0.jpg", _FEDB + "Barbell_Curl/1.jpg"],
+    },
+    "Squat": {
+        "muscles": ["Quads", "Glutes", "Hamstrings", "Core"],
+        "cues": ["Feet roughly shoulder width", "Chest up, brace your core",
+                 "Break at the hips and knees together", "Knees track over the toes", "Drive through mid-foot to stand"],
+        "images": [_FEDB + "Barbell_Squat/0.jpg", _FEDB + "Barbell_Squat/1.jpg"],
+    },
+    "RDL": {
+        "muscles": ["Hamstrings", "Glutes", "Lower Back"],
+        "cues": ["Soft knee bend, hinge at the hips", "Keep the bar/dumbbells close to your legs",
+                 "Flat back throughout", "Feel the stretch in the hamstrings, then drive hips forward"],
+        "images": [_FEDB + "Romanian_Deadlift/0.jpg", _FEDB + "Romanian_Deadlift/1.jpg"],
+    },
+    "Leg Press": {
+        "muscles": ["Quads", "Glutes", "Hamstrings"],
+        "cues": ["Feet shoulder width on the platform", "Lower until knees reach ~90°",
+                 "Don't let your lower back round off the pad", "Avoid locking knees hard at the top"],
+        "images": [_FEDB + "Leg_Press/0.jpg", _FEDB + "Leg_Press/1.jpg"],
+    },
+    "Lunges": {
+        "muscles": ["Quads", "Glutes", "Hamstrings"],
+        "cues": ["Step far enough forward for a 90° front knee", "Keep torso upright",
+                 "Back knee drops toward the floor without slamming it", "Push through the front heel to return"],
+        "images": [_FEDB + "Dumbbell_Lunges/0.jpg", _FEDB + "Dumbbell_Lunges/1.jpg"],
+    },
+    "Leg Curl": {
+        "muscles": ["Hamstrings"],
+        "cues": ["Hips pinned to the pad", "Curl through a full range of motion",
+                 "Control the weight on the way back"],
+        "images": [_FEDB + "Lying_Leg_Curls/0.jpg", _FEDB + "Lying_Leg_Curls/1.jpg"],
+    },
+    "Calves": {
+        "muscles": ["Calves"],
+        "cues": ["Full stretch at the bottom", "Rise fully onto the toes",
+                 "Pause briefly at the top for a real contraction"],
+        "images": [_FEDB + "Standing_Calf_Raises/0.jpg", _FEDB + "Standing_Calf_Raises/1.jpg"],
+    },
+    "Incline Bench": {
+        "muscles": ["Upper Chest", "Front Shoulders", "Triceps"],
+        "cues": ["Bench at a 30-45° incline", "Retract shoulder blades",
+                 "Lower to upper chest with control", "Press up and slightly back"],
+        "images": [_FEDB + "Barbell_Incline_Bench_Press_-_Medium_Grip/0.jpg", _FEDB + "Barbell_Incline_Bench_Press_-_Medium_Grip/1.jpg"],
+    },
+    "Pull Ups/Pulldown": {
+        "muscles": ["Lats", "Biceps", "Upper Back"],
+        "cues": ["Full hang at the bottom", "Pull elbows down and back, chest to the bar",
+                 "Avoid excessive kipping/swinging"],
+        "images": [_FEDB + "Pullups/0.jpg", _FEDB + "Pullups/1.jpg"],
+    },
+    "Pull Ups": {
+        "muscles": ["Lats", "Biceps", "Upper Back"],
+        "cues": ["Full hang at the bottom, shoulders active", "Pull elbows down and back, chin over the bar",
+                 "Lower under control rather than dropping"],
+        "images": [_FEDB + "Pullups/0.jpg", _FEDB + "Pullups/1.jpg"],
+    },
+    "Chest Press": {
+        "muscles": ["Chest", "Front Shoulders", "Triceps"],
+        "cues": ["Seat height so handles line up with mid-chest", "Press forward without shrugging",
+                 "Control the return to a full stretch"],
+        "images": [_FEDB + "Cable_Chest_Press/0.jpg", _FEDB + "Cable_Chest_Press/1.jpg"],
+    },
+    "Row": {
+        "muscles": ["Lats", "Rhomboids", "Rear Shoulders", "Biceps"],
+        "cues": ["Chest against the pad or flat back if standing", "Pull elbows back, squeeze shoulder blades",
+                 "Avoid jerking the weight with momentum"],
+        "images": [_FEDB + "Seated_Cable_Rows/0.jpg", _FEDB + "Seated_Cable_Rows/1.jpg"],
+    },
+    "Shoulders": {
+        "muscles": ["Shoulders"],
+        "cues": ["Controlled tempo, avoid using momentum", "Full range of motion",
+                 "Keep the core braced to protect the lower back"],
+        "images": [_FEDB + "Dumbbell_Shoulder_Press/0.jpg", _FEDB + "Dumbbell_Shoulder_Press/1.jpg"],
+    },
+    "Arms": {
+        "muscles": ["Biceps", "Triceps"],
+        "cues": ["Elbows stay fixed in place", "Control both the lift and the lowering phase",
+                 "Full range of motion each rep"],
+        "images": [_FEDB + "Barbell_Curl/0.jpg", _FEDB + "Barbell_Curl/1.jpg"],
+    },
+    "Cardio": {
+        "muscles": ["Heart/Lungs (conditioning)"],
+        "cues": ["Warm up for a few minutes first", "Keep a pace you can sustain for the full duration",
+                 "Cool down and stretch after"],
+        "images": [],
+    },
+    "Abs": {
+        "muscles": ["Core / Abdominals"],
+        "cues": ["Control the movement, avoid yanking with the neck", "Exhale on the contraction",
+                 "Keep the lower back from over-arching"],
+        "images": [_FEDB + "Cable_Crunch/0.jpg", _FEDB + "Cable_Crunch/1.jpg"],
+    },
+    "Stretch": {
+        "muscles": ["Full body mobility"],
+        "cues": ["Hold each stretch 20-30 seconds", "Breathe, don't bounce",
+                 "Stretch to mild tension, not pain"],
+        "images": [],
+    },
+    # --- Walking / rest entries: no demo image needed, just context ---
+    "15 min incline walk": {
+        "muscles": ["Calves", "Glutes", "Heart/Lungs"],
+        "cues": ["Treadmill incline around 8-12%", "Comfortable pace you can hold the whole time",
+                 "Don't hold the handrails — it kills the effort"],
+        "images": [],
+    },
+    "20 min incline walk": {
+        "muscles": ["Calves", "Glutes", "Heart/Lungs"],
+        "cues": ["Treadmill incline around 8-12%", "Comfortable pace you can hold the whole time",
+                 "Don't hold the handrails — it kills the effort"],
+        "images": [],
+    },
+    "30-45 min walk": {
+        "muscles": ["Heart/Lungs", "Legs"],
+        "cues": ["Easy conversational pace", "Outdoors or treadmill both fine",
+                 "Great for hitting the daily step target"],
+        "images": [],
+    },
+    "45 min walk or football": {
+        "muscles": ["Heart/Lungs", "Legs"],
+        "cues": ["Keep it genuinely easy — this is recovery, not a session",
+                 "If playing football, warm up properly first"],
+        "images": [],
+    },
+    "Rest and 10k steps": {
+        "muscles": ["Recovery day"],
+        "cues": ["No lifting today — let the body repair", "Still aim for your step target",
+                 "Prioritise sleep and hydration"],
+        "images": [],
+    },
+}
+# NOTE: images come from https://github.com/yuhonas/free-exercise-db (public
+# domain / Unlicense). These are two static photos (start position, end
+# position) per exercise, NOT an animated GIF — I checked, and I couldn't find
+# a source of real looping demo GIFs that reliably hotlinks and covers this
+# exercise list without risking broken images or licensing issues. Shown
+# side-by-side it still gives a clear "how it looks" reference. If you find a
+# GIF host you like better, just swap the URLs in the "images" lists above —
+# any number of image URLs in that list will render side by side.
+
+
+def base_exercise_name(name):
+    """Strip trailing set/rep notation like '4x6-8' or '3x10' so the name
+    can be matched against EXERCISE_INFO regardless of the day's set/rep scheme."""
+    cleaned = re.sub(r"\s*\d+\s*x\s*[\d\-]+\s*$", "", name, flags=re.IGNORECASE).strip()
+    return cleaned
+
 
 # ---------------------------------------------------------------
 # TRANSLATIONS (UI chrome only — your own data/notes stay as typed)
@@ -129,6 +402,43 @@ BASE_EN = {
     "gym_bro_placeholder": "Ask Gym Bro a question...",
     "gym_bro_disclaimer": "Gym Bro gives general fitness/nutrition info, not medical advice. For injuries, pain, or health conditions, see a doctor.",
     "gym_bro_missing_key": "Gym Bro needs a free Gemini API key to work. Add it in your secrets.toml — see the setup notes.",
+    "exercise_info_label": "ℹ️ How to do it",
+    "muscles_targeted_label": "Muscles targeted",
+    "form_cues_label": "Form cues",
+    "no_info_label": "No demo added yet for this exercise — fill in EXERCISE_INFO to add one.",
+    "swap_label": "🔄 Swap this exercise",
+    "swap_placeholder": "e.g. Pull Ups",
+    "swap_confirm": "Swap",
+    "revert_swap_label": "↩ Revert to original",
+    "swapped_from_label": "Swapped from",
+    "gym_bro_clear": "🗑 Clear chat",
+    # --- sets / reps / weight logging ---
+    "sets_header": "Sets", "set_label": "Set", "reps_label": "Reps",
+    "weight_kg_label": "kg", "add_set": "➕ Add set", "remove_set": "➖ Remove last set",
+    "last_time_label": "Last time", "no_history_label": "No history yet for this lift",
+    "session_volume_label": "Session volume", "e1rm_label": "Est. 1RM",
+    "exercise_note_label": "Note for this exercise",
+    # --- rest timer ---
+    "rest_timer_label": "⏱ Rest timer", "start_timer": "Start",
+    # --- tabs ---
+    "tab_workout": "🏋️ Workout", "tab_meals": "🍽️ Meals", "tab_numbers": "📊 Numbers",
+    # --- plan editor ---
+    "nav_plan": "Workout Plan", "plan_header": "🗓️ Edit Your Workout Plan",
+    "plan_intro": "Change your split here — no code editing needed. Applies from today onwards.",
+    "day_label_label": "Day label", "exercises_label": "Exercises (one per line)",
+    "save_plan": "Save plan", "reset_plan": "↺ Reset this day to default",
+    # --- rest week ---
+    "rest_week_label": "Mark this week as a deload / rest week",
+    "rest_week_on": "🌙 Deload week — adherence stats won't count against you.",
+    # --- PRs & analytics ---
+    "lift_prs_header": "🏋️ Lift Records", "strength_trend_header": "📈 Strength Trend",
+    "pick_lift_label": "Pick a lift", "muscle_volume_header": "💪 Weekly Muscle Volume",
+    "muscle_volume_caption": "Total kg lifted per muscle region this week",
+    "no_volume_yet": "Log some sets with weights to see your muscle volume breakdown.",
+    # --- export ---
+    "export_header": "📤 Export Data", "export_caption": "Download your logs as CSV.",
+    "download_daily": "⬇ Daily log", "download_sets": "⬇ Training sets",
+    "download_measurements": "⬇ Measurements",
 }
 
 BASE_AF = {
@@ -426,7 +736,6 @@ for lang in TRANSLATIONS:
 def t(key):
     lang = st.session_state.get("language", "English")
     return TRANSLATIONS.get(lang, {}).get(key, TRANSLATIONS["English"].get(key, key))
-
 # ---------------------------------------------------------------
 # DATABASE (Postgres via Supabase)
 # ---------------------------------------------------------------
@@ -452,10 +761,28 @@ def get_conn():
     cur.execute("""CREATE TABLE IF NOT EXISTS progress_photos (
         id SERIAL PRIMARY KEY, log_date TEXT, caption TEXT, photo_data BYTEA,
         uploaded_at TIMESTAMP DEFAULT now())""")
-    # NEW: profile (single row)
     cur.execute("""CREATE TABLE IF NOT EXISTS profile (
         id INTEGER PRIMARY KEY DEFAULT 1, goal TEXT, height_cm REAL, weight_kg REAL,
         age INTEGER, sex TEXT, country TEXT, activity_level TEXT)""")
+    # NEW: per-day exercise substitutions (e.g. did Pull Ups instead of Deadlift)
+    cur.execute("""CREATE TABLE IF NOT EXISTS exercise_swaps (
+        log_date TEXT, original_exercise TEXT, replacement_exercise TEXT,
+        PRIMARY KEY (log_date, original_exercise))""")
+    # NEW: actual training data — sets, reps, load
+    cur.execute("""CREATE TABLE IF NOT EXISTS exercise_sets (
+        log_date TEXT, exercise TEXT, set_number INTEGER,
+        reps INTEGER DEFAULT 0, weight_kg REAL DEFAULT 0,
+        PRIMARY KEY (log_date, exercise, set_number))""")
+    # NEW: free-text note per exercise per day ("left shoulder tight")
+    cur.execute("""CREATE TABLE IF NOT EXISTS exercise_notes (
+        log_date TEXT, exercise TEXT, note TEXT DEFAULT '',
+        PRIMARY KEY (log_date, exercise))""")
+    # NEW: the workout split itself, so it's editable in-app instead of in code
+    cur.execute("""CREATE TABLE IF NOT EXISTS workout_plan (
+        weekday TEXT, position INTEGER, exercise TEXT, day_label TEXT,
+        PRIMARY KEY (weekday, position))""")
+    # NEW: deload / rest weeks (keyed by the Monday of that week)
+    cur.execute("""CREATE TABLE IF NOT EXISTS rest_weeks (week_start TEXT PRIMARY KEY)""")
     cur.close()
     return conn
 
@@ -637,6 +964,25 @@ def get_all_logged_exercises(log_date):
 def remove_exercise(log_date, exercise):
     run("DELETE FROM exercise_checks WHERE log_date=%s AND exercise=%s", (log_date, exercise))
 
+# ---- NEW: exercise swaps (e.g. "did Pull Ups instead of Deadlift today") ----
+def get_exercise_swap(log_date, original_exercise):
+    """Returns the replacement name for this original exercise on this date, or None."""
+    cols, rows = fetch(
+        "SELECT replacement_exercise FROM exercise_swaps WHERE log_date=%s AND original_exercise=%s",
+        (log_date, original_exercise))
+    return rows[0][0] if rows else None
+
+def set_exercise_swap(log_date, original_exercise, replacement_exercise):
+    run("""INSERT INTO exercise_swaps (log_date, original_exercise, replacement_exercise)
+           VALUES (%s, %s, %s)
+           ON CONFLICT (log_date, original_exercise) DO UPDATE SET
+           replacement_exercise=excluded.replacement_exercise""",
+        (log_date, original_exercise, replacement_exercise))
+
+def remove_exercise_swap(log_date, original_exercise):
+    run("DELETE FROM exercise_swaps WHERE log_date=%s AND original_exercise=%s",
+        (log_date, original_exercise))
+
 def get_range_df(start, end):
     q = "SELECT * FROM daily_log WHERE log_date BETWEEN %s AND %s ORDER BY log_date"
     return pd.read_sql_query(q, get_live_conn(), params=(start.isoformat(), end.isoformat()))
@@ -690,6 +1036,142 @@ def get_all_photos():
 def delete_photo(photo_id):
     run("DELETE FROM progress_photos WHERE id=%s", (photo_id,))
 
+# ---------------------------------------------------------------
+# WORKOUT PLAN (editable in-app, seeded from GYM_SPLIT defaults)
+# ---------------------------------------------------------------
+def seed_plan_if_empty():
+    """First run: copy the hardcoded GYM_SPLIT defaults into the DB."""
+    _, rows = fetch("SELECT COUNT(*) FROM workout_plan")
+    if rows and rows[0][0] > 0:
+        return
+    for weekday, plan in GYM_SPLIT.items():
+        for i, ex in enumerate(plan["exercises"]):
+            run("""INSERT INTO workout_plan (weekday, position, exercise, day_label)
+                   VALUES (%s, %s, %s, %s)
+                   ON CONFLICT (weekday, position) DO NOTHING""",
+                (weekday, i, ex, plan["label"]))
+
+
+def load_plan():
+    """Returns the same shape as GYM_SPLIT, but read from the DB."""
+    seed_plan_if_empty()
+    cols, rows = fetch(
+        "SELECT weekday, position, exercise, day_label FROM workout_plan ORDER BY weekday, position")
+    plan = {}
+    for weekday, position, exercise, day_label in rows:
+        entry = plan.setdefault(weekday, {"label": day_label or "", "exercises": []})
+        if day_label:
+            entry["label"] = day_label
+        entry["exercises"].append(exercise)
+    # Any weekday missing from the DB falls back to the hardcoded default
+    for weekday, default in GYM_SPLIT.items():
+        if weekday not in plan or not plan[weekday]["exercises"]:
+            plan[weekday] = {"label": default["label"], "exercises": list(default["exercises"])}
+    return plan
+
+
+def save_plan_day(weekday, day_label, exercises):
+    run("DELETE FROM workout_plan WHERE weekday=%s", (weekday,))
+    for i, ex in enumerate(exercises):
+        ex = ex.strip()
+        if ex:
+            run("""INSERT INTO workout_plan (weekday, position, exercise, day_label)
+                   VALUES (%s, %s, %s, %s)""", (weekday, i, ex, day_label))
+
+
+def reset_plan_day(weekday):
+    default = GYM_SPLIT[weekday]
+    save_plan_day(weekday, default["label"], list(default["exercises"]))
+
+
+# ---------------------------------------------------------------
+# SETS / REPS / WEIGHT  (the actual training log)
+# ---------------------------------------------------------------
+def get_sets(log_date, exercise):
+    """Returns [{'set_number':1,'reps':8,'weight_kg':80.0}, ...] ordered by set number."""
+    cols, rows = fetch("""SELECT set_number, reps, weight_kg FROM exercise_sets
+                          WHERE log_date=%s AND exercise=%s ORDER BY set_number""",
+                       (log_date, exercise))
+    return [{"set_number": r[0], "reps": r[1] or 0, "weight_kg": r[2] or 0.0} for r in rows]
+
+
+def save_set(log_date, exercise, set_number, reps, weight_kg):
+    run("""INSERT INTO exercise_sets (log_date, exercise, set_number, reps, weight_kg)
+           VALUES (%s, %s, %s, %s, %s)
+           ON CONFLICT (log_date, exercise, set_number) DO UPDATE SET
+           reps=excluded.reps, weight_kg=excluded.weight_kg""",
+        (log_date, exercise, set_number, int(reps or 0), float(weight_kg or 0)))
+
+
+def delete_last_set(log_date, exercise):
+    run("""DELETE FROM exercise_sets WHERE log_date=%s AND exercise=%s
+           AND set_number = (SELECT MAX(set_number) FROM exercise_sets
+                             WHERE log_date=%s AND exercise=%s)""",
+        (log_date, exercise, log_date, exercise))
+
+
+def get_last_session(exercise, before_date):
+    """Most recent day BEFORE `before_date` where this exercise had logged sets.
+
+    This powers the 'Last time: 80kg x 8, 80kg x 7' hint — the single most
+    useful thing to see while standing in the gym.
+    """
+    cols, rows = fetch("""SELECT MAX(log_date) FROM exercise_sets
+                          WHERE exercise=%s AND log_date < %s
+                          AND (reps > 0 OR weight_kg > 0)""",
+                       (exercise, before_date))
+    if not rows or not rows[0][0]:
+        return None, []
+    prev_date = rows[0][0]
+    return prev_date, get_sets(prev_date, exercise)
+
+
+def get_exercise_note(log_date, exercise):
+    cols, rows = fetch("SELECT note FROM exercise_notes WHERE log_date=%s AND exercise=%s",
+                       (log_date, exercise))
+    return rows[0][0] if rows else ""
+
+
+def set_exercise_note(log_date, exercise, note):
+    run("""INSERT INTO exercise_notes (log_date, exercise, note) VALUES (%s, %s, %s)
+           ON CONFLICT (log_date, exercise) DO UPDATE SET note=excluded.note""",
+        (log_date, exercise, note))
+
+
+def get_all_sets_df():
+    return pd.read_sql_query(
+        "SELECT log_date, exercise, set_number, reps, weight_kg FROM exercise_sets "
+        "ORDER BY log_date, exercise, set_number", get_live_conn())
+
+
+def get_sets_for_range(start, end):
+    return pd.read_sql_query(
+        "SELECT log_date, exercise, set_number, reps, weight_kg FROM exercise_sets "
+        "WHERE log_date BETWEEN %s AND %s ORDER BY log_date",
+        get_live_conn(), params=(start.isoformat(), end.isoformat()))
+
+
+def get_logged_exercise_names():
+    """Distinct exercises that have any set data — for the strength-trend picker."""
+    cols, rows = fetch("""SELECT DISTINCT exercise FROM exercise_sets
+                          WHERE weight_kg > 0 ORDER BY exercise""")
+    return [r[0] for r in rows]
+
+
+# ---------------------------------------------------------------
+# REST / DELOAD WEEKS
+# ---------------------------------------------------------------
+def is_rest_week(week_start):
+    cols, rows = fetch("SELECT 1 FROM rest_weeks WHERE week_start=%s", (week_start.isoformat(),))
+    return bool(rows)
+
+
+def set_rest_week(week_start, enabled):
+    if enabled:
+        run("INSERT INTO rest_weeks (week_start) VALUES (%s) ON CONFLICT DO NOTHING",
+            (week_start.isoformat(),))
+    else:
+        run("DELETE FROM rest_weeks WHERE week_start=%s", (week_start.isoformat(),))
 # ---------------------------------------------------------------
 # STREAKS & BADGES
 # ---------------------------------------------------------------
@@ -759,7 +1241,7 @@ def fetch_daily_row_readonly(log_date):
 def compute_momentum_score(log_date_str, weekday, targets):
     row = fetch_daily_row_readonly(log_date_str)
     meal_state = get_meal_checks(log_date_str)
-    day_plan = GYM_SPLIT[weekday]
+    day_plan = PLAN[weekday]
     ex_state = get_exercise_checks(log_date_str, day_plan["exercises"])
 
     protein = row["protein_g"] or 0
@@ -781,7 +1263,7 @@ def compute_momentum_score(log_date_str, weekday, targets):
 def get_perfect_day_status(log_date_str, weekday, targets):
     row = fetch_daily_row_readonly(log_date_str)
     meal_state = get_meal_checks(log_date_str)
-    day_plan = GYM_SPLIT[weekday]
+    day_plan = PLAN[weekday]
     ex_state = get_exercise_checks(log_date_str, day_plan["exercises"])
 
     protein_hit = (row["protein_g"] or 0) >= targets["protein_min"]
@@ -859,7 +1341,7 @@ def compute_perfect_days_count(targets):
             wd = WEEKDAY_NAMES[pd.to_datetime(r["log_date"]).weekday()]
         except Exception:
             continue
-        expected_ex = len(GYM_SPLIT[wd]["exercises"])
+        expected_ex = len(PLAN[wd]["exercises"])
         if (r["protein_g"] >= targets["protein_min"] and r["water_l"] >= targets["water_min"] and
                 r["steps"] >= targets["steps_min"] and r["meals_done"] >= len(MEALS) and
                 r["ex_done"] >= expected_ex):
@@ -949,7 +1431,7 @@ def get_next_streak_badge(current_streak):
 def generate_coach_notes(log_date_str, weekday, targets):
     row = fetch_daily_row_readonly(log_date_str)
     meal_state = get_meal_checks(log_date_str)
-    day_plan = GYM_SPLIT[weekday]
+    day_plan = PLAN[weekday]
     ex_state = get_exercise_checks(log_date_str, day_plan["exercises"])
 
     protein = row["protein_g"] or 0
@@ -1012,6 +1494,77 @@ def get_daily_quote():
     return QUOTES[date.today().toordinal() % len(QUOTES)]
 
 # ---------------------------------------------------------------
+# STRENGTH: PRs, estimated 1RM trend, muscle volume
+# ---------------------------------------------------------------
+def get_lift_prs(limit=12):
+    """Heaviest single set per exercise, plus the best estimated 1RM.
+
+    Ranked by estimated 1RM so a heavy triple beats a light set of 20.
+    """
+    cols, rows = fetch("""SELECT exercise, reps, weight_kg, log_date FROM exercise_sets
+                          WHERE weight_kg > 0 AND reps > 0""")
+    best = {}
+    for exercise, reps, weight, log_date in rows:
+        e1rm = estimated_1rm(weight, reps)
+        cur = best.get(exercise)
+        if cur is None or e1rm > cur["e1rm"]:
+            best[exercise] = {"exercise": exercise, "weight_kg": float(weight),
+                              "reps": int(reps), "e1rm": e1rm, "log_date": log_date}
+    ranked = sorted(best.values(), key=lambda r: r["e1rm"], reverse=True)
+    return ranked[:limit]
+
+
+def get_strength_trend(exercise):
+    """Per-session best estimated 1RM for one exercise, as a tidy DataFrame."""
+    cols, rows = fetch("""SELECT log_date, reps, weight_kg FROM exercise_sets
+                          WHERE exercise=%s AND weight_kg > 0 AND reps > 0
+                          ORDER BY log_date""", (exercise,))
+    if not rows:
+        return pd.DataFrame()
+    per_day = {}
+    for log_date, reps, weight in rows:
+        e1rm = estimated_1rm(weight, reps)
+        if log_date not in per_day or e1rm > per_day[log_date]["e1rm"]:
+            per_day[log_date] = {"log_date": log_date, "e1rm": round(e1rm, 1),
+                                 "top_weight": float(weight)}
+    df = pd.DataFrame(sorted(per_day.values(), key=lambda r: r["log_date"]))
+    df["log_date"] = pd.to_datetime(df["log_date"])
+    return df
+
+
+def get_muscle_volume_for_range(start, end):
+    """Total kg-volume (weight x reps) per canonical muscle region.
+
+    Volume from a multi-muscle lift is credited in full to each region it hits,
+    so these numbers show relative emphasis rather than a strict kg total.
+    """
+    df = get_sets_for_range(start, end)
+    totals = {region: 0.0 for region in MUSCLE_REGIONS}
+    if df.empty:
+        return totals
+    for _, r in df.iterrows():
+        vol = float(r["weight_kg"] or 0) * int(r["reps"] or 0)
+        if vol <= 0:
+            continue
+        for region in muscle_regions_for(r["exercise"]):
+            totals[region] += vol
+    return totals
+
+
+def get_session_volume(log_date, exercise):
+    return sum(float(s["weight_kg"] or 0) * int(s["reps"] or 0) for s in get_sets(log_date, exercise))
+
+
+def format_set_summary(sets):
+    """'80kg x 8, 80kg x 7, 75kg x 8' — compact enough to sit under a heading."""
+    parts = []
+    for s in sets:
+        w, r = s["weight_kg"], s["reps"]
+        if not r:
+            continue
+        parts.append(f"{w:g}kg × {r}" if w else f"BW × {r}")
+    return ", ".join(parts)
+# ---------------------------------------------------------------
 # GYM BRO (AI chatbot — free Gemini API)
 # ---------------------------------------------------------------
 GYM_BRO_SYSTEM_PROMPT = """You are "Gym Bro" — a friendly, knowledgeable fitness buddy inside the Momentum app.
@@ -1029,93 +1582,240 @@ Rules you always follow:
 - Never claim certainty about individualized medical outcomes.
 """
 
-def ask_gym_bro(user_message, chat_history, profile, targets):
-    if not GEMINI_AVAILABLE:
-        return "⚠️ The Gemini library isn't installed yet. Run `pip install google-generativeai` and add it to requirements.txt."
+def get_gemini_api_key():
+    """Reads the Gemini API key from secrets.toml. Supports both
+    [gemini] api_key = "..."  and a bare  gemini_api_key = "..."  entry."""
+    try:
+        if "gemini" in st.secrets and "api_key" in st.secrets["gemini"]:
+            return str(st.secrets["gemini"]["api_key"]).strip()
+        if "gemini_api_key" in st.secrets:
+            return str(st.secrets["gemini_api_key"]).strip()
+    except Exception:
+        pass
+    return None
 
-    api_key = st.secrets.get("gemini", {}).get("api_key") if hasattr(st, "secrets") else None
+
+def _gym_bro_via_sdk(system_prompt, contents_plain, api_key):
+    """Attempt the call through Google's official google-genai SDK.
+
+    Returns (text, None) on success, or (None, error_string) on failure.
+    Returns (None, "SDK_MISSING") if the library isn't installed.
+
+    Worth trying before raw REST: the official SDK handles credential plumbing
+    internally, and during Google's AIza -> AQ. key migration some accounts see
+    raw REST calls rejected with ACCESS_TOKEN_TYPE_UNSUPPORTED while the SDK
+    path still works.
+    """
+    try:
+        from google import genai
+        from google.genai import types
+    except ImportError:
+        return None, "SDK_MISSING"
+
+    try:
+        client = genai.Client(api_key=api_key)
+        contents = [
+            types.Content(role=role, parts=[types.Part.from_text(text=text)])
+            for role, text in contents_plain
+        ]
+        resp = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=contents,
+            config=types.GenerateContentConfig(system_instruction=system_prompt),
+        )
+        text = (resp.text or "").strip()
+        return (text, None) if text else (None, "Empty reply from Gemini.")
+    except Exception as e:
+        return None, f"{type(e).__name__}: {e}"
+
+
+def ask_gym_bro(user_message, chat_history, profile, targets):
+    """Sends the question to Gemini.
+
+    Tries the official google-genai SDK first, then falls back to a raw REST call
+    (query param, then x-goog-api-key header). Belt and braces, because Google's
+    ongoing AIza -> AQ. API key migration has left some accounts where one route
+    authenticates and another returns 401 ACCESS_TOKEN_TYPE_UNSUPPORTED.
+
+    We deliberately never validate the shape of the key — a key starting with
+    `AQ.` is the current correct format, and the format is Google's to change.
+    """
+    api_key = get_gemini_api_key()
     if not api_key:
         return None  # signals missing key to the caller
 
+    context = (
+        f"[User context - goal: {profile.get('goal')}, activity level: {profile.get('activity_level')}, "
+        f"protein target: {targets.get('protein_min')}-{targets.get('protein_max')}g, "
+        f"step target: {targets.get('steps_min')}-{targets.get('steps_max')}]"
+    )
+    final_question = f"{context}\n\nUser question: {user_message}"
+
+    # (role, text) pairs, shared by both the SDK and REST paths
+    contents_plain = [
+        ("user" if role == "user" else "model", text) for role, text in chat_history[-10:]
+    ]
+    contents_plain.append(("user", final_question))
+
+    # --- Attempt 1: official SDK ---
+    sdk_text, sdk_err = _gym_bro_via_sdk(GYM_BRO_SYSTEM_PROMPT, contents_plain, api_key)
+    if sdk_text:
+        return sdk_text
+
+    # --- Attempt 2: raw REST ---
+    url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
+    payload = {
+        "systemInstruction": {"parts": [{"text": GYM_BRO_SYSTEM_PROMPT}]},
+        "contents": [
+            {"role": role, "parts": [{"text": text}]} for role, text in contents_plain
+        ],
+    }
+
+    def _call(use_header):
+        if use_header:
+            return requests.post(
+                url, headers={"x-goog-api-key": api_key}, json=payload, timeout=45)
+        return requests.post(url, params={"key": api_key}, json=payload, timeout=45)
+
     try:
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel("gemini-2.5-flash", system_instruction=GYM_BRO_SYSTEM_PROMPT)
-
-        context = (
-            f"[User context — goal: {profile.get('goal')}, activity level: {profile.get('activity_level')}, "
-            f"protein target: {targets.get('protein_min')}-{targets.get('protein_max')}g, "
-            f"step target: {targets.get('steps_min')}-{targets.get('steps_max')}]"
-        )
-
-        history_for_model = []
-        for role, text in chat_history[-10:]:
-            history_for_model.append({"role": "user" if role == "user" else "model", "parts": [text]})
-
-        chat = model.start_chat(history=history_for_model)
-        response = chat.send_message(f"{context}\n\nUser question: {user_message}")
-        return response.text
+        resp = _call(use_header=False)
+        if resp.status_code in (401, 403):
+            resp = _call(use_header=True)
     except Exception as e:
-        return f"⚠️ Gym Bro hit an error talking to Gemini: {e}"
+        return f"⚠️ Couldn't reach Gemini: {e}"
+
+    if resp.status_code == 200:
+        try:
+            parts = resp.json()["candidates"][0]["content"]["parts"]
+            text = "".join(p.get("text", "") for p in parts).strip()
+            if text:
+                return text
+            return "⚠️ Gemini returned an empty reply. Try rephrasing the question."
+        except Exception:
+            return f"⚠️ Couldn't parse Gemini's reply: {resp.text[:300]}"
+
+    if resp.status_code in (401, 403):
+        sdk_note = ""
+        if sdk_err == "SDK_MISSING":
+            sdk_note = ("\n\n**The google-genai SDK isn't installed.** Try "
+                        "`pip install google-genai` — on some accounts the SDK path works "
+                        "where raw REST doesn't.")
+        elif sdk_err:
+            sdk_note = f"\n\nThe SDK route also failed: `{sdk_err[:180]}`"
+
+        return (
+            "⚠️ Gemini rejected the key (401/403) on **every** route tried — SDK, "
+            "`?key=` query param, and `x-goog-api-key` header.\n\n"
+            "This is very likely **not your key and not this app.** Google is migrating "
+            "API keys from `AIza...` to `AQ....`, and a number of accounts are stuck where "
+            "every new `AQ.` key is refused by the Gemini API with exactly this "
+            "`ACCESS_TOKEN_TYPE_UNSUPPORTED` error. Regenerating the key or making a new "
+            "project does not fix it.\n\n"
+            "**What to do:** report it to Google with your project number so they can "
+            "unblock the account — see the compatibility form linked from "
+            "https://ai.google.dev/gemini-api/docs/api-key . Everything else in Momentum "
+            "works fine in the meantime."
+            + sdk_note
+            + f"\n\nRaw response: {resp.text[:200]}"
+        )
+    if resp.status_code == 404:
+        return (
+            "⚠️ Model not found (404). `gemini-2.5-flash` may have been renamed or retired. "
+            "Check https://ai.google.dev/gemini-api/docs/models and update the model name "
+            "in ask_gym_bro().\n\n"
+            f"Details: {resp.text[:200]}"
+        )
+    if resp.status_code == 429:
+        return "⚠️ Gemini rate limit hit (429). Give it a minute and try again."
+    if resp.status_code == 400:
+        return (
+            "⚠️ Gemini rejected the request (400). Usually a truncated key, or the model "
+            f"isn't available to your account.\n\nDetails: {resp.text[:250]}"
+        )
+    return f"⚠️ Gemini returned HTTP {resp.status_code}: {resp.text[:300]}"
 
 def render_gym_bro_widget():
-    """Floating chat bubble, available on every page."""
+    """Single floating chat bubble, available on every page.
+
+    Everything (messages + the input box) lives INSIDE the popover. Previously
+    st.chat_input sat outside the popover, which is why a second stray input
+    panel appeared on screen next to the bubble.
+    """
     st.markdown("""
     <style>
-    div[data-testid="stPopover"] {
+    @keyframes gymBroPulse {
+      0%, 100% { box-shadow: 0 4px 16px rgba(59,130,246,0.5); }
+      50% { box-shadow: 0 4px 26px rgba(59,130,246,0.9); }
+    }
+    div.st-key-gym_bro_float {
         position: fixed !important;
         bottom: 28px !important;
         right: 28px !important;
         left: auto !important;
-        top: auto !important;
         z-index: 999999 !important;
         width: auto !important;
     }
-    div[data-testid="stPopover"] > div {
-        position: static !important;
-    }
-    div[data-testid="stPopover"] button {
+    div.st-key-gym_bro_float > div > div > button {
         border-radius: 50% !important;
         width: 64px !important;
         height: 64px !important;
         min-width: 64px !important;
+        padding: 0 !important;
         font-size: 1.8rem !important;
         background: linear-gradient(135deg, #3b82f6, #8b5cf6) !important;
         color: white !important;
-        border: 2px solid rgba(255,255,255,0.25) !important;
-        box-shadow: 0 4px 16px rgba(0,0,0,0.45) !important;
+        border: 2px solid rgba(255,255,255,0.3) !important;
+        animation: gymBroPulse 2.5s ease-in-out infinite;
     }
     </style>
     """, unsafe_allow_html=True)
 
-    with st.popover("💪"):
-        st.markdown(f"**{t('gym_bro_header')}**")
-        st.caption(t("gym_bro_intro"))
-        st.caption(t("gym_bro_disclaimer"))
+    if "gym_bro_messages" not in st.session_state:
+        st.session_state.gym_bro_messages = []
 
-        api_key_present = bool(st.secrets.get("gemini", {}).get("api_key")) if hasattr(st, "secrets") else False
-        if not api_key_present:
-            st.warning(t("gym_bro_missing_key"))
+    with st.container(key="gym_bro_float"):
+        with st.popover("🏋️", use_container_width=False):
+            st.markdown(f"**{t('gym_bro_header')}**")
+            st.caption(t("gym_bro_intro"))
+            st.caption(t("gym_bro_disclaimer"))
 
-        if "gym_bro_messages" not in st.session_state:
-            st.session_state.gym_bro_messages = []
+            if not get_gemini_api_key():
+                st.warning(t("gym_bro_missing_key"))
 
-        chat_box = st.container(height=300)
-        with chat_box:
-            for role, text in st.session_state.gym_bro_messages:
-                with st.chat_message("user" if role == "user" else "assistant"):
-                    st.markdown(text)
+            chat_box = st.container(height=280)
+            with chat_box:
+                if not st.session_state.gym_bro_messages:
+                    st.caption("No messages yet — ask something below 👇")
+                for role, text in st.session_state.gym_bro_messages:
+                    with st.chat_message("user" if role == "user" else "assistant"):
+                        st.markdown(text)
 
-        user_input = st.chat_input(t("gym_bro_placeholder"), key="gym_bro_input")
-        if user_input:
-            st.session_state.gym_bro_messages.append(("user", user_input))
-            profile = get_profile()
-            with st.spinner("..."):
-                reply = ask_gym_bro(user_input, st.session_state.gym_bro_messages[:-1], profile, TARGETS)
-            if reply is None:
-                reply = t("gym_bro_missing_key")
-            st.session_state.gym_bro_messages.append(("assistant", reply))
-            st.rerun()
+            # Plain text_input + button instead of st.chat_input, because
+            # st.chat_input always renders pinned to the page rather than
+            # inside the popover — that was the duplicate box.
+            gb1, gb2 = st.columns([4, 1])
+            with gb1:
+                user_input = st.text_input(
+                    t("gym_bro_placeholder"), key="gym_bro_text",
+                    label_visibility="collapsed", placeholder=t("gym_bro_placeholder"))
+            with gb2:
+                send = st.button("➤", key="gym_bro_send", use_container_width=True)
 
+            if st.session_state.gym_bro_messages:
+                if st.button(t("gym_bro_clear"), key="gym_bro_clear_btn"):
+                    st.session_state.gym_bro_messages = []
+                    st.rerun()
+
+            if send and user_input.strip():
+                st.session_state.gym_bro_messages.append(("user", user_input.strip()))
+                profile = get_profile()
+                with st.spinner("Thinking..."):
+                    reply = ask_gym_bro(
+                        user_input.strip(), st.session_state.gym_bro_messages[:-1], profile, TARGETS)
+                if reply is None:
+                    reply = t("gym_bro_missing_key")
+                st.session_state.gym_bro_messages.append(("assistant", reply))
+                st.rerun()
 # ---------------------------------------------------------------
 # WEIGHT PREDICTION
 # ---------------------------------------------------------------
@@ -1390,6 +2090,156 @@ def get_bottle_message(pct):
     else:
         return t("bottle_0")
 
+def render_rest_timer(seconds, key_suffix):
+    """Self-contained countdown that runs in the browser, so it keeps ticking
+    without Streamlit reruns. Beeps at zero using the same WebAudio trick as
+    the perfect-day chime."""
+    uid = re.sub(r"[^A-Za-z0-9_]", "_", str(key_suffix))
+    html = f"""
+    <style>
+    .rt-wrap-{uid} {{ display:flex; align-items:center; gap:10px; padding:4px 0;
+                      font-family: -apple-system, "Segoe UI", sans-serif; }}
+    .rt-time-{uid} {{ font-size:1.9rem; font-weight:800; color:#3b82f6;
+                      font-variant-numeric: tabular-nums; min-width:96px; }}
+    .rt-bar-{uid} {{ flex:1; height:8px; background:rgba(147,163,184,0.25);
+                     border-radius:4px; overflow:hidden; }}
+    .rt-fill-{uid} {{ height:100%; width:100%; background:linear-gradient(90deg,#3b82f6,#8b5cf6);
+                      border-radius:4px; transition:width 1s linear; }}
+    .rt-done-{uid} {{ color:#10b981 !important; }}
+    </style>
+    <div class="rt-wrap-{uid}">
+      <div class="rt-time-{uid}" id="rt-time-{uid}">--:--</div>
+      <div class="rt-bar-{uid}"><div class="rt-fill-{uid}" id="rt-fill-{uid}"></div></div>
+    </div>
+    <script>
+    (function() {{
+      const total = {int(seconds)};
+      let left = total;
+      const timeEl = document.getElementById('rt-time-{uid}');
+      const fillEl = document.getElementById('rt-fill-{uid}');
+      function fmt(s) {{
+        const m = Math.floor(s / 60), r = s % 60;
+        return m + ':' + String(r).padStart(2, '0');
+      }}
+      function beep() {{
+        try {{
+          const ctx = new (window.AudioContext || window.webkitAudioContext)();
+          [880, 1174.7, 880].forEach((f, i) => {{
+            const o = ctx.createOscillator(), g = ctx.createGain();
+            o.frequency.value = f; o.type = 'sine';
+            g.gain.setValueAtTime(0.2, ctx.currentTime + i * 0.18);
+            g.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + i * 0.18 + 0.32);
+            o.connect(g); g.connect(ctx.destination);
+            o.start(ctx.currentTime + i * 0.18); o.stop(ctx.currentTime + i * 0.18 + 0.32);
+          }});
+        }} catch (e) {{}}
+      }}
+      timeEl.innerText = fmt(left);
+      const iv = setInterval(function() {{
+        left -= 1;
+        if (left <= 0) {{
+          clearInterval(iv);
+          timeEl.innerText = "GO 💪";
+          timeEl.classList.add('rt-done-{uid}');
+          fillEl.style.width = '0%';
+          beep();
+          return;
+        }}
+        timeEl.innerText = fmt(left);
+        fillEl.style.width = (left / total * 100) + '%';
+      }}, 1000);
+    }})();
+    </script>
+    """
+    components.html(html, height=64)
+
+
+def render_muscle_heatmap(volume_by_region):
+    """Front/back body silhouette with muscle regions shaded by training volume.
+
+    Deliberately schematic rather than anatomical — the point is at-a-glance
+    'what have I hammered and what have I neglected this week'.
+    """
+    max_vol = max(volume_by_region.values()) if volume_by_region else 0
+    if max_vol <= 0:
+        return False
+
+    def shade(region):
+        v = volume_by_region.get(region, 0)
+        ratio = (v / max_vol) if max_vol else 0
+        if ratio <= 0:
+            return "rgba(147,163,184,0.18)"
+        # pale blue -> hot violet as volume climbs
+        r = int(59 + (139 - 59) * ratio)
+        g = int(130 + (92 - 130) * ratio)
+        b = int(246 + (246 - 246) * ratio)
+        alpha = 0.28 + 0.72 * ratio
+        return f"rgba({r},{g},{b},{alpha:.2f})"
+
+    legend = ""
+    for region in MUSCLE_REGIONS:
+        v = volume_by_region.get(region, 0)
+        legend += (
+            f'<div style="display:flex;align-items:center;gap:6px;font-size:0.72rem;">'
+            f'<span style="width:11px;height:11px;border-radius:3px;background:{shade(region)};'
+            f'display:inline-block;border:1px solid rgba(147,163,184,0.35);"></span>'
+            f'<span style="color:#9aa5b1;">{region}</span>'
+            f'<span style="margin-left:auto;font-weight:600;color:#e6edf3;">{v:,.0f}</span></div>'
+        )
+
+    html = f"""
+    <div style="display:flex;gap:18px;align-items:flex-start;flex-wrap:wrap;
+                font-family:-apple-system,'Segoe UI',sans-serif;">
+      <svg width="290" height="300" viewBox="0 0 290 300">
+        <!-- ============ FRONT ============ -->
+        <text x="62" y="14" font-size="10" fill="#9aa5b1" text-anchor="middle">FRONT</text>
+        <circle cx="62" cy="36" r="13" fill="rgba(147,163,184,0.22)"/>
+        <rect x="52" y="50" width="20" height="8" rx="3" fill="rgba(147,163,184,0.22)"/>
+        <!-- shoulders -->
+        <circle cx="40" cy="66" r="11" fill="{shade('Shoulders')}"/>
+        <circle cx="84" cy="66" r="11" fill="{shade('Shoulders')}"/>
+        <!-- chest -->
+        <rect x="43" y="60" width="38" height="26" rx="7" fill="{shade('Chest')}"/>
+        <!-- core -->
+        <rect x="47" y="88" width="30" height="34" rx="6" fill="{shade('Core')}"/>
+        <!-- biceps -->
+        <rect x="26" y="76" width="13" height="34" rx="6" fill="{shade('Biceps')}"/>
+        <rect x="85" y="76" width="13" height="34" rx="6" fill="{shade('Biceps')}"/>
+        <!-- quads -->
+        <rect x="45" y="126" width="16" height="52" rx="7" fill="{shade('Quads')}"/>
+        <rect x="63" y="126" width="16" height="52" rx="7" fill="{shade('Quads')}"/>
+        <!-- calves (front view lower leg) -->
+        <rect x="47" y="182" width="12" height="42" rx="6" fill="{shade('Calves')}"/>
+        <rect x="65" y="182" width="12" height="42" rx="6" fill="{shade('Calves')}"/>
+
+        <!-- ============ BACK ============ -->
+        <text x="205" y="14" font-size="10" fill="#9aa5b1" text-anchor="middle">BACK</text>
+        <circle cx="205" cy="36" r="13" fill="rgba(147,163,184,0.22)"/>
+        <rect x="195" y="50" width="20" height="8" rx="3" fill="rgba(147,163,184,0.22)"/>
+        <!-- rear delts -->
+        <circle cx="183" cy="66" r="11" fill="{shade('Shoulders')}"/>
+        <circle cx="227" cy="66" r="11" fill="{shade('Shoulders')}"/>
+        <!-- back / lats -->
+        <rect x="186" y="60" width="38" height="46" rx="7" fill="{shade('Back')}"/>
+        <!-- triceps -->
+        <rect x="169" y="76" width="13" height="34" rx="6" fill="{shade('Triceps')}"/>
+        <rect x="228" y="76" width="13" height="34" rx="6" fill="{shade('Triceps')}"/>
+        <!-- glutes -->
+        <rect x="188" y="110" width="34" height="20" rx="8" fill="{shade('Glutes')}"/>
+        <!-- hamstrings -->
+        <rect x="188" y="134" width="16" height="46" rx="7" fill="{shade('Hamstrings')}"/>
+        <rect x="206" y="134" width="16" height="46" rx="7" fill="{shade('Hamstrings')}"/>
+        <!-- calves -->
+        <rect x="190" y="184" width="12" height="42" rx="6" fill="{shade('Calves')}"/>
+        <rect x="208" y="184" width="12" height="42" rx="6" fill="{shade('Calves')}"/>
+      </svg>
+      <div style="display:flex;flex-direction:column;gap:5px;min-width:170px;padding-top:16px;">
+        {legend}
+      </div>
+    </div>
+    """
+    components.html(html, height=320)
+    return True
 # ---------------------------------------------------------------
 # UI
 # ---------------------------------------------------------------
@@ -1409,11 +2259,16 @@ with st.sidebar:
     st.caption("💡 Tip: use the ⋮ menu (top right) → Settings → Theme for light/dark mode.")
     page = st.radio(
         t("app_title"),
-        [t("nav_home"), t("nav_today"), t("nav_weight_log"), t("nav_weekly_dashboard"), t("nav_measurements"),
-         t("nav_photos"), t("nav_achievements"), t("nav_profile"), t("nav_settings")],
+        [t("nav_home"), t("nav_today"), t("nav_weight_log"), t("nav_weekly_dashboard"),
+         t("nav_measurements"), t("nav_photos"), t("nav_achievements"), t("nav_plan"),
+         t("nav_profile"), t("nav_settings")],
         label_visibility="collapsed"
     )
 
+# PLAN is the editable workout split, loaded from the DB (seeded from GYM_SPLIT
+# on first run). Everything downstream reads PLAN, never GYM_SPLIT directly, so
+# edits made on the Workout Plan page take effect everywhere.
+PLAN = load_plan()
 TARGETS = load_targets()
 st.title(t("app_title"))
 render_gym_bro_widget()
@@ -1422,7 +2277,7 @@ if page == t("nav_home"):
     today = date.today()
     today_str = today.isoformat()
     weekday = WEEKDAY_NAMES[today.weekday()]
-    day_plan = GYM_SPLIT[weekday]
+    day_plan = PLAN[weekday]
 
     streak, longest, total_days = compute_streak_stats()
     score = compute_momentum_score(today_str, weekday, TARGETS)
@@ -1459,13 +2314,20 @@ if page == t("nav_home"):
     else:
         st.caption(f"{t('next_badge_label')}: 🏅 All streak badges unlocked!")
 
+    # Weekly muscle volume — the at-a-glance "what am I neglecting" view
+    st.markdown(f"#### {t('muscle_volume_header')}")
+    st.caption(t("muscle_volume_caption"))
+    wk_start = today - timedelta(days=today.weekday())
+    if not render_muscle_heatmap(get_muscle_volume_for_range(wk_start, wk_start + timedelta(days=6))):
+        st.info(t("no_volume_yet"))
+
 elif page == t("nav_today"):
     col1, col2, col3 = st.columns([1, 2, 1])
     with col1:
-        if st.button(t("prev_day")):
+        if st.button(t("prev_day"), use_container_width=True):
             st.session_state.selected_date -= timedelta(days=1)
     with col3:
-        if st.button(t("next_day")):
+        if st.button(t("next_day"), use_container_width=True):
             st.session_state.selected_date += timedelta(days=1)
     with col2:
         picked = st.date_input("Date", value=st.session_state.selected_date, label_visibility="collapsed")
@@ -1474,151 +2336,300 @@ elif page == t("nav_today"):
     log_date = st.session_state.selected_date
     log_date_str = log_date.isoformat()
     weekday = WEEKDAY_NAMES[log_date.weekday()]
-    day_plan = GYM_SPLIT[weekday]
+    day_plan = PLAN[weekday]
+    week_start = log_date - timedelta(days=log_date.weekday())
 
     st.subheader(f"{weekday}, {log_date.strftime('%d %b %Y')}")
     st.caption(f"{t('gym_label')}: **{day_plan['label']}**")
 
     row = get_daily_row(log_date_str)
 
-    streak, longest, total_days = compute_streak_stats()
-    badges = get_earned_badges(longest, total_days)
-    with st.expander(t("streak_header"), expanded=False):
-        s1, s2, s3 = st.columns(3)
-        s1.metric(t("current_streak_label"), f"{streak} 🔥")
-        s2.metric(t("longest_streak_label"), f"{longest}")
-        s3.metric(t("days_logged_label"), f"{total_days}")
-        if badges:
-            st.caption(f"{t('badges_label')}: " + " · ".join(badges))
-
     score = compute_momentum_score(log_date_str, weekday, TARGETS)
     render_momentum_score_badge(score)
+
+    if is_rest_week(week_start):
+        st.info(t("rest_week_on"))
 
     if get_perfect_day_status(log_date_str, weekday, TARGETS):
         render_perfect_day_celebration()
 
-    with st.expander(t("coach_header"), expanded=False):
-        coach_lines, coach_focus = generate_coach_notes(log_date_str, weekday, TARGETS)
-        for line in coach_lines:
-            st.write(line)
-        st.markdown(f"**{t('coach_tomorrow_focus')}**")
-        for f in coach_focus:
-            st.write(f"• {f}")
+    # Workout first — on a training day that's what you actually open the app for.
+    tab_workout, tab_meals, tab_numbers = st.tabs(
+        [t("tab_workout"), t("tab_meals"), t("tab_numbers")])
 
-    st.markdown(f"### {t('meals_header')}")
-    meal_state = get_meal_checks(log_date_str)
-    meal_details = get_meal_details(log_date_str)
-    day_calories_total = 0
-    day_meal_protein_total = 0
+    # =========================== WORKOUT ===========================
+    with tab_workout:
+        ex_state = get_exercise_checks(log_date_str, day_plan["exercises"])
 
-    for meal in MEALS:
-        details = meal_details[meal]
-        header = meal
-        if details["note"]:
-            header += f" — {details['note'][:30]}{'…' if len(details['note']) > 30 else ''}"
-        with st.expander(header, expanded=False):
-            checked = st.checkbox(t("done_label"), value=meal_state[meal], key=f"meal_{log_date_str}_{meal}")
-            if checked != meal_state[meal]:
-                set_meal_check(log_date_str, meal, checked)
-            if checked:
-                render_meal_stamp()
-            note = st.text_input(t("what_did_you_have"), value=details["note"], key=f"meal_note_{log_date_str}_{meal}")
-            mc1, mc2 = st.columns(2)
-            with mc1:
-                cals = st.number_input(t("calories_label"), min_value=0.0, value=float(details["calories"]),
-                                        step=10.0, key=f"meal_cal_{log_date_str}_{meal}")
-            with mc2:
-                prot = st.number_input(t("protein_label"), min_value=0.0, value=float(details["protein_g"]),
-                                        step=1.0, key=f"meal_prot_{log_date_str}_{meal}")
-            if (note, cals, prot) != (details["note"], details["calories"], details["protein_g"]):
-                set_meal_detail(log_date_str, meal, note, cals, prot)
-            day_calories_total += cals
-            day_meal_protein_total += prot
-
-    st.caption(
-        f"{day_calories_total:.0f} kcal · {day_meal_protein_total:.0f}g "
-        f"(target {TARGETS['calories_min']:.0f}-{TARGETS['calories_max']:.0f} kcal, "
-        f"{TARGETS['protein_min']:.0f}-{TARGETS['protein_max']:.0f}g protein)"
-    )
-
-    st.markdown(f"### {t('workout_header')} — {day_plan['label']}")
-    ex_state = get_exercise_checks(log_date_str, day_plan["exercises"])
-
-    bottle_col, list_col = st.columns([1, 2])
-    with list_col:
-        for ex in day_plan["exercises"]:
-            checked = st.checkbox(ex, value=ex_state[ex], key=f"ex_{log_date_str}_{ex}")
-            if checked != ex_state[ex]:
-                set_exercise_check(log_date_str, ex, checked)
-                ex_state[ex] = checked
-    with bottle_col:
         total_ex = len(day_plan["exercises"])
         done_ex = sum(1 for ex in day_plan["exercises"] if ex_state[ex])
         pct = (done_ex / total_ex * 100) if total_ex else 0
-        render_bottle(pct, get_bottle_message(pct))
 
-    # ---- Extra exercises (anything logged beyond today's fixed plan) ----
-    st.markdown(f"##### {t('extra_exercises_header')}")
-    all_logged = get_all_logged_exercises(log_date_str)
-    extra_names = [name for name in all_logged if name not in day_plan["exercises"]]
+        bottle_col, head_col = st.columns([1, 2])
+        with bottle_col:
+            render_bottle(pct, get_bottle_message(pct))
+        with head_col:
+            st.markdown(f"### {day_plan['label']}")
+            st.caption(f"{done_ex}/{total_ex} exercises done")
+            with st.expander(t("rest_timer_label"), expanded=False):
+                rt1, rt2, rt3 = st.columns(3)
+                for secs, col in ((60, rt1), (90, rt2), (180, rt3)):
+                    with col:
+                        if st.button(f"{secs//60}:{secs%60:02d}", key=f"rt_{log_date_str}_{secs}",
+                                     use_container_width=True):
+                            st.session_state["active_timer"] = secs
+                if st.session_state.get("active_timer"):
+                    render_rest_timer(st.session_state["active_timer"],
+                                      f"{log_date_str}_{st.session_state['active_timer']}")
 
-    for name in extra_names:
-        ec1, ec2 = st.columns([5, 1])
-        with ec1:
-            checked = st.checkbox(name, value=bool(all_logged[name]), key=f"extra_{log_date_str}_{name}")
-            if checked != bool(all_logged[name]):
-                set_exercise_check(log_date_str, name, checked)
-        with ec2:
-            if st.button(t("delete_label"), key=f"extra_del_{log_date_str}_{name}"):
-                remove_exercise(log_date_str, name)
-                st.rerun()
+        st.markdown("---")
 
-    new_extra_col1, new_extra_col2 = st.columns([4, 1])
-    with new_extra_col1:
-        new_extra_name = st.text_input(
-            t("add_extra_placeholder"), key=f"new_extra_{log_date_str}", label_visibility="collapsed",
-            placeholder=t("add_extra_placeholder")
-        )
-    with new_extra_col2:
-        if st.button(t("add_extra_button"), key=f"add_extra_btn_{log_date_str}"):
-            if new_extra_name.strip():
-                set_exercise_check(log_date_str, new_extra_name.strip(), True)
-                st.rerun()
+        for ex in day_plan["exercises"]:
+            swap = get_exercise_swap(log_date_str, ex)
+            effective_name = swap if swap else ex
 
-    st.markdown(f"### {t('daily_numbers_header')}")
-    n1, n2, n3 = st.columns(3)
-    with n1:
-        protein = st.number_input(
-            f"{t('protein_label')} — target {TARGETS['protein_min']:.0f}-{TARGETS['protein_max']:.0f}g",
-            min_value=0.0, value=float(row["protein_g"] or 0), step=5.0, key=f"protein_{log_date_str}")
-        if st.button(t("use_meal_total"), key=f"use_meal_protein_{log_date_str}"):
-            protein = day_meal_protein_total
-    with n2:
-        water = st.number_input(
-            f"{t('water_label')} — target {TARGETS['water_min']}-{TARGETS['water_max']}L",
-            min_value=0.0, value=float(row["water_l"] or 0), step=0.25, key=f"water_{log_date_str}")
-    with n3:
-        steps = st.number_input(
-            f"{t('steps_label')} — target {TARGETS['steps_min']:,.0f}-{TARGETS['steps_max']:,.0f}",
-            min_value=0, value=int(row["steps"] or 0), step=500, key=f"steps_{log_date_str}")
+            checkbox_label = effective_name if not swap else f"{effective_name}  🔄"
+            checked = st.checkbox(checkbox_label, value=ex_state[ex], key=f"ex_{log_date_str}_{ex}")
+            # Checkbox state stays keyed on the ORIGINAL name so streaks, momentum
+            # score and perfect-day logic are unaffected by swaps.
+            if checked != ex_state[ex]:
+                set_exercise_check(log_date_str, ex, checked)
+                ex_state[ex] = checked
 
-    st.progress(min(protein / TARGETS["protein_min"], 1.0) if TARGETS["protein_min"] else 0,
-                text=f"{t('protein_label')}: {protein:.0f}g / {TARGETS['protein_min']:.0f}g min")
-    st.progress(min(water / TARGETS["water_min"], 1.0) if TARGETS["water_min"] else 0,
-                text=f"{t('water_label')}: {water:.2f}L / {TARGETS['water_min']}L min")
-    st.progress(min(steps / TARGETS["steps_min"], 1.0) if TARGETS["steps_min"] else 0,
-                text=f"{t('steps_label')}: {steps:,} / {TARGETS['steps_min']:,.0f} min")
+            # "Last time" hint — the single most useful thing mid-workout
+            prev_date, prev_sets = get_last_session(effective_name, log_date_str)
+            if prev_sets:
+                summary = format_set_summary(prev_sets)
+                if summary:
+                    st.caption(f"↩ {t('last_time_label')} ({prev_date}): {summary}")
 
-    st.markdown(f"### {t('weight_section_header')}")
-    weight = st.number_input(t("weight_label"), min_value=0.0,
-                              value=float(row["weight_kg"]) if row["weight_kg"] else 0.0,
-                              step=0.1, key=f"weight_{log_date_str}")
-    notes = st.text_area(t("notes_label"), value=row["notes"] or "", key=f"notes_{log_date_str}")
+            with st.expander(f"{t('exercise_info_label')} — {effective_name}", expanded=False):
+                info_key = base_exercise_name(effective_name)
+                info = EXERCISE_INFO.get(info_key)
 
-    if st.button(t("save_button"), type="primary"):
-        save_daily_row(log_date_str, protein, water, steps, weight if weight > 0 else None, notes)
-        st.success(t("saved_msg"))
+                if swap:
+                    st.caption(f"{t('swapped_from_label')}: {ex}")
+                    if st.button(t("revert_swap_label"), key=f"revert_{log_date_str}_{ex}"):
+                        remove_exercise_swap(log_date_str, ex)
+                        st.rerun()
 
+                # ---------------- SETS / REPS / WEIGHT ----------------
+                st.markdown(f"**{t('sets_header')}**")
+                sets = get_sets(log_date_str, effective_name)
+                if not sets:
+                    sets = [{"set_number": 1, "reps": 0, "weight_kg": 0.0}]
+
+                for s in sets:
+                    sc1, sc2, sc3 = st.columns([1, 2, 2])
+                    with sc1:
+                        st.markdown(
+                            f"<div style='padding-top:32px;color:#9aa5b1;font-size:0.8rem;'>"
+                            f"{t('set_label')} {s['set_number']}</div>", unsafe_allow_html=True)
+                    with sc2:
+                        w = st.number_input(
+                            t("weight_kg_label"), min_value=0.0, step=2.5,
+                            value=float(s["weight_kg"] or 0),
+                            key=f"w_{log_date_str}_{effective_name}_{s['set_number']}")
+                    with sc3:
+                        r = st.number_input(
+                            t("reps_label"), min_value=0, step=1, value=int(s["reps"] or 0),
+                            key=f"r_{log_date_str}_{effective_name}_{s['set_number']}")
+                    if (w, r) != (s["weight_kg"], s["reps"]):
+                        save_set(log_date_str, effective_name, s["set_number"], r, w)
+
+                ac1, ac2 = st.columns(2)
+                with ac1:
+                    if st.button(t("add_set"), key=f"addset_{log_date_str}_{effective_name}",
+                                 use_container_width=True):
+                        save_set(log_date_str, effective_name, len(sets) + 1, 0, 0)
+                        st.rerun()
+                with ac2:
+                    if len(sets) > 1 and st.button(
+                            t("remove_set"), key=f"delset_{log_date_str}_{effective_name}",
+                            use_container_width=True):
+                        delete_last_set(log_date_str, effective_name)
+                        st.rerun()
+
+                vol = get_session_volume(log_date_str, effective_name)
+                best = max((estimated_1rm(s["weight_kg"], s["reps"])
+                            for s in get_sets(log_date_str, effective_name)), default=0)
+                if vol > 0:
+                    v1, v2 = st.columns(2)
+                    v1.metric(t("session_volume_label"), f"{vol:,.0f} kg")
+                    v2.metric(t("e1rm_label"), f"{best:.1f} kg")
+
+                note = st.text_input(
+                    t("exercise_note_label"), value=get_exercise_note(log_date_str, effective_name),
+                    key=f"exnote_{log_date_str}_{effective_name}")
+                if note != get_exercise_note(log_date_str, effective_name):
+                    set_exercise_note(log_date_str, effective_name, note)
+
+                # ---------------- DEMO / FORM ----------------
+                st.markdown("---")
+                if info:
+                    imgs = info.get("images") or []
+                    if imgs:
+                        img_cols = st.columns(len(imgs))
+                        phase_labels = ["Start position", "End position"]
+                        for i, (c, img_url) in enumerate(zip(img_cols, imgs)):
+                            with c:
+                                st.image(
+                                    img_url,
+                                    caption=phase_labels[i] if i < len(phase_labels) else f"Step {i+1}",
+                                    use_container_width=True)
+                    if info.get("muscles"):
+                        st.markdown(f"**{t('muscles_targeted_label')}:** " + ", ".join(info["muscles"]))
+                    if info.get("cues"):
+                        st.markdown(f"**{t('form_cues_label')}:**")
+                        for cue in info["cues"]:
+                            st.markdown(f"- {cue}")
+                else:
+                    st.caption(t("no_info_label"))
+
+                st.markdown(f"**{t('swap_label')}**")
+                sw1, sw2 = st.columns([3, 1])
+                with sw1:
+                    new_name = st.text_input(
+                        t("swap_placeholder"), value="", key=f"swap_input_{log_date_str}_{ex}",
+                        label_visibility="collapsed", placeholder=t("swap_placeholder"))
+                with sw2:
+                    if st.button(t("swap_confirm"), key=f"swap_btn_{log_date_str}_{ex}",
+                                 use_container_width=True):
+                        if new_name.strip():
+                            set_exercise_swap(log_date_str, ex, new_name.strip())
+                            st.rerun()
+
+        # ---- Extra exercises (anything beyond today's plan) ----
+        st.markdown(f"##### {t('extra_exercises_header')}")
+        all_logged = get_all_logged_exercises(log_date_str)
+        extra_names = [name for name in all_logged if name not in day_plan["exercises"]]
+
+        for name in extra_names:
+            ec1, ec2 = st.columns([5, 1])
+            with ec1:
+                checked = st.checkbox(name, value=bool(all_logged[name]),
+                                      key=f"extra_{log_date_str}_{name}")
+                if checked != bool(all_logged[name]):
+                    set_exercise_check(log_date_str, name, checked)
+            with ec2:
+                if st.button(t("delete_label"), key=f"extra_del_{log_date_str}_{name}"):
+                    remove_exercise(log_date_str, name)
+                    st.rerun()
+
+        new_extra_col1, new_extra_col2 = st.columns([4, 1])
+        with new_extra_col1:
+            new_extra_name = st.text_input(
+                t("add_extra_placeholder"), key=f"new_extra_{log_date_str}",
+                label_visibility="collapsed", placeholder=t("add_extra_placeholder"))
+        with new_extra_col2:
+            if st.button(t("add_extra_button"), key=f"add_extra_btn_{log_date_str}",
+                         use_container_width=True):
+                if new_extra_name.strip():
+                    set_exercise_check(log_date_str, new_extra_name.strip(), True)
+                    st.rerun()
+
+    # ============================ MEALS ============================
+    with tab_meals:
+        meal_state = get_meal_checks(log_date_str)
+        meal_details = get_meal_details(log_date_str)
+        day_calories_total = 0
+        day_meal_protein_total = 0
+
+        for meal in MEALS:
+            details = meal_details[meal]
+            header = meal
+            if details["note"]:
+                header += f" — {details['note'][:30]}{'…' if len(details['note']) > 30 else ''}"
+            with st.expander(header, expanded=False):
+                checked = st.checkbox(t("done_label"), value=meal_state[meal],
+                                      key=f"meal_{log_date_str}_{meal}")
+                if checked != meal_state[meal]:
+                    set_meal_check(log_date_str, meal, checked)
+                if checked:
+                    render_meal_stamp()
+                note = st.text_input(t("what_did_you_have"), value=details["note"],
+                                     key=f"meal_note_{log_date_str}_{meal}")
+                mc1, mc2 = st.columns(2)
+                with mc1:
+                    cals = st.number_input(t("calories_label"), min_value=0.0,
+                                           value=float(details["calories"]), step=10.0,
+                                           key=f"meal_cal_{log_date_str}_{meal}")
+                with mc2:
+                    prot = st.number_input(t("protein_label"), min_value=0.0,
+                                           value=float(details["protein_g"]), step=1.0,
+                                           key=f"meal_prot_{log_date_str}_{meal}")
+                if (note, cals, prot) != (details["note"], details["calories"], details["protein_g"]):
+                    set_meal_detail(log_date_str, meal, note, cals, prot)
+                day_calories_total += cals
+                day_meal_protein_total += prot
+
+        st.caption(
+            f"{day_calories_total:.0f} kcal · {day_meal_protein_total:.0f}g "
+            f"(target {TARGETS['calories_min']:.0f}-{TARGETS['calories_max']:.0f} kcal, "
+            f"{TARGETS['protein_min']:.0f}-{TARGETS['protein_max']:.0f}g protein)")
+
+    # =========================== NUMBERS ===========================
+    with tab_numbers:
+        n1, n2, n3 = st.columns(3)
+        with n1:
+            protein = st.number_input(
+                f"{t('protein_label')} — target {TARGETS['protein_min']:.0f}-{TARGETS['protein_max']:.0f}g",
+                min_value=0.0, value=float(row["protein_g"] or 0), step=5.0,
+                key=f"protein_{log_date_str}")
+            if st.button(t("use_meal_total"), key=f"use_meal_protein_{log_date_str}"):
+                protein = day_meal_protein_total
+        with n2:
+            water = st.number_input(
+                f"{t('water_label')} — target {TARGETS['water_min']}-{TARGETS['water_max']}L",
+                min_value=0.0, value=float(row["water_l"] or 0), step=0.25,
+                key=f"water_{log_date_str}")
+        with n3:
+            steps = st.number_input(
+                f"{t('steps_label')} — target {TARGETS['steps_min']:,.0f}-{TARGETS['steps_max']:,.0f}",
+                min_value=0, value=int(row["steps"] or 0), step=500, key=f"steps_{log_date_str}")
+
+        st.progress(min(protein / TARGETS["protein_min"], 1.0) if TARGETS["protein_min"] else 0,
+                    text=f"{t('protein_label')}: {protein:.0f}g / {TARGETS['protein_min']:.0f}g min")
+        st.progress(min(water / TARGETS["water_min"], 1.0) if TARGETS["water_min"] else 0,
+                    text=f"{t('water_label')}: {water:.2f}L / {TARGETS['water_min']}L min")
+        st.progress(min(steps / TARGETS["steps_min"], 1.0) if TARGETS["steps_min"] else 0,
+                    text=f"{t('steps_label')}: {steps:,} / {TARGETS['steps_min']:,.0f} min")
+
+        st.markdown(f"##### {t('weight_section_header')}")
+        weight = st.number_input(t("weight_label"), min_value=0.0,
+                                 value=float(row["weight_kg"]) if row["weight_kg"] else 0.0,
+                                 step=0.1, key=f"weight_{log_date_str}")
+        notes = st.text_area(t("notes_label"), value=row["notes"] or "", key=f"notes_{log_date_str}")
+
+        if st.button(t("save_button"), type="primary", use_container_width=True):
+            save_daily_row(log_date_str, protein, water, steps,
+                           weight if weight > 0 else None, notes)
+            st.success(t("saved_msg"))
+
+        st.markdown("---")
+        deload = st.checkbox(t("rest_week_label"), value=is_rest_week(week_start),
+                             key=f"restweek_{week_start.isoformat()}")
+        if deload != is_rest_week(week_start):
+            set_rest_week(week_start, deload)
+            st.rerun()
+
+        with st.expander(t("streak_header"), expanded=False):
+            streak, longest, total_days = compute_streak_stats()
+            badges = get_earned_badges(longest, total_days)
+            s1, s2, s3 = st.columns(3)
+            s1.metric(t("current_streak_label"), f"{streak} 🔥")
+            s2.metric(t("longest_streak_label"), f"{longest}")
+            s3.metric(t("days_logged_label"), f"{total_days}")
+            if badges:
+                st.caption(f"{t('badges_label')}: " + " · ".join(badges))
+
+        with st.expander(t("coach_header"), expanded=False):
+            coach_lines, coach_focus = generate_coach_notes(log_date_str, weekday, TARGETS)
+            for line in coach_lines:
+                st.write(line)
+            st.markdown(f"**{t('coach_tomorrow_focus')}**")
+            for f in coach_focus:
+                st.write(f"• {f}")
 elif page == t("nav_weight_log"):
     st.subheader(t("weight_trend_header"))
     end = date.today()
@@ -1680,6 +2691,8 @@ elif page == t("nav_weekly_dashboard"):
     start_of_week = today - timedelta(days=today.weekday()) + timedelta(weeks=st.session_state.week_offset)
     end_of_week = start_of_week + timedelta(days=6)
     st.caption(f"{start_of_week.strftime('%d %b')} – {end_of_week.strftime('%d %b %Y')}")
+    if is_rest_week(start_of_week):
+        st.info(t("rest_week_on"))
 
     daily_df = get_range_df(start_of_week, end_of_week)
     meal_df = get_meal_completion_for_range(start_of_week, end_of_week)
@@ -1901,6 +2914,68 @@ elif page == t("nav_achievements"):
     p2.metric(t("pr_longest_streak_label"), f"{stats['longest_streak']} days")
     p3.metric(t("pr_max_protein_label"), f"{stats['max_protein_day']:,.0f}g")
 
+    # ---- Lift records, driven by the sets/reps/weight log ----
+    st.markdown(f"#### {t('lift_prs_header')}")
+    prs = get_lift_prs()
+    if prs:
+        pr_df = pd.DataFrame([{
+            "Exercise": r["exercise"],
+            "Best set": f"{r['weight_kg']:g}kg × {r['reps']}",
+            "Est. 1RM": f"{r['e1rm']:.1f}kg",
+            "Date": r["log_date"],
+        } for r in prs])
+        st.dataframe(pr_df, hide_index=True, use_container_width=True)
+    else:
+        st.info("Log some sets with weight on the Today page to start building lift records.")
+
+    st.markdown(f"#### {t('strength_trend_header')}")
+    lifts = get_logged_exercise_names()
+    if lifts:
+        chosen = st.selectbox(t("pick_lift_label"), lifts, key="strength_pick")
+        trend = get_strength_trend(chosen)
+        if len(trend) >= 2:
+            fig_s = px.line(trend, x="log_date", y="e1rm", markers=True,
+                            title=f"Estimated 1RM — {chosen}")
+            fig_s.update_layout(yaxis_title="Est. 1RM (kg)", xaxis_title="")
+            st.plotly_chart(fig_s, use_container_width=True)
+            first, last = trend["e1rm"].iloc[0], trend["e1rm"].iloc[-1]
+            st.caption(f"Change since first session: {last - first:+.1f} kg")
+        else:
+            st.caption("Log this lift on at least two separate days to see a trend.")
+    else:
+        st.caption("No weighted sets logged yet.")
+
+elif page == t("nav_plan"):
+    st.subheader(t("plan_header"))
+    st.caption(t("plan_intro"))
+
+    for weekday in WEEKDAY_NAMES:
+        current_day = PLAN[weekday]
+        with st.expander(f"{weekday} — {current_day['label']}", expanded=False):
+            label = st.text_input(t("day_label_label"), value=current_day["label"],
+                                  key=f"plan_label_{weekday}")
+            ex_text = st.text_area(
+                t("exercises_label"), value="\n".join(current_day["exercises"]),
+                height=200, key=f"plan_ex_{weekday}",
+                help="One exercise per line. Set/rep notation like '4x6-8' is optional "
+                     "and is stripped when matching the demo images.")
+            pc1, pc2 = st.columns(2)
+            with pc1:
+                if st.button(t("save_plan"), key=f"plan_save_{weekday}",
+                             type="primary", use_container_width=True):
+                    exercises = [line.strip() for line in ex_text.split("\n") if line.strip()]
+                    if exercises:
+                        save_plan_day(weekday, label.strip() or weekday, exercises)
+                        st.success(t("saved_msg"))
+                        st.rerun()
+                    else:
+                        st.warning("Add at least one exercise before saving.")
+            with pc2:
+                if st.button(t("reset_plan"), key=f"plan_reset_{weekday}",
+                             use_container_width=True):
+                    reset_plan_day(weekday)
+                    st.rerun()
+
 elif page == t("nav_profile"):
     st.subheader(t("profile_header"))
     st.caption(t("profile_disclaimer"))
@@ -1955,3 +3030,23 @@ elif page == t("nav_settings"):
         })
         st.success(t("saved_msg"))
         st.rerun()
+
+    st.markdown("---")
+    st.markdown(f"#### {t('export_header')}")
+    st.caption(t("export_caption"))
+    e1, e2, e3 = st.columns(3)
+    with e1:
+        daily_all = get_range_df(date(2000, 1, 1), date.today())
+        st.download_button(t("download_daily"), daily_all.to_csv(index=False).encode("utf-8"),
+                           file_name="momentum_daily_log.csv", mime="text/csv",
+                           use_container_width=True)
+    with e2:
+        sets_all = get_all_sets_df()
+        st.download_button(t("download_sets"), sets_all.to_csv(index=False).encode("utf-8"),
+                           file_name="momentum_training_sets.csv", mime="text/csv",
+                           use_container_width=True)
+    with e3:
+        meas_all = get_all_measurements()
+        st.download_button(t("download_measurements"), meas_all.to_csv(index=False).encode("utf-8"),
+                           file_name="momentum_measurements.csv", mime="text/csv",
+                           use_container_width=True)
