@@ -120,6 +120,199 @@ def muscle_regions_for(exercise_name):
     return out
 
 
+# ---------------------------------------------------------------
+# EXERCISE LIBRARY (~260 movements, loaded from exercise_library.json)
+# ---------------------------------------------------------------
+# Keeps gymap.py readable while still covering whatever you swap in. Data is
+# from https://github.com/yuhonas/free-exercise-db (public domain / Unlicense).
+# The hand-written EXERCISE_INFO entries above always take priority.
+@st.cache_data(show_spinner=False)
+def load_exercise_library():
+    import json, os
+    # Look next to this script first, then the working directory. Falls back to
+    # an empty library so a missing file degrades gracefully rather than crashing.
+    candidates = []
+    try:
+        candidates.append(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                       "exercise_library.json"))
+    except NameError:
+        pass
+    candidates.append(os.path.join(os.getcwd(), "exercise_library.json"))
+
+    payload = None
+    for path in candidates:
+        try:
+            with open(path, encoding="utf-8") as fh:
+                payload = json.load(fh)
+                break
+        except Exception:
+            continue
+    if payload is None:
+        return {}
+    base = payload.get("image_base", "")
+    out = {}
+    for name, entry in payload.get("exercises", {}).items():
+        out[name] = {
+            "muscles": entry.get("muscles", []),
+            "cues": entry.get("cues", []),
+            "images": [base + img for img in entry.get("images", [])],
+        }
+    return out
+
+
+def _normalise_exercise_name(name):
+    """Lowercase, drop set/rep notation and punctuation, collapse whitespace.
+
+    So 'Pull ups', 'PULL-UPS' and 'Pull Ups 3x10' all resolve to the same thing.
+    """
+    n = base_exercise_name(name).lower()
+    n = re.sub(r"[^a-z0-9 ]+", " ", n)
+    return re.sub(r"\s+", " ", n).strip()
+
+
+# Common gym shorthand -> a name that exists in the library.
+EXERCISE_ALIASES = {
+    "rdl": "Romanian Deadlift", "sldl": "Stiff-Legged Barbell Deadlift",
+    "ohp": "Standing Military Press", "overhead press": "Standing Military Press",
+    "bench": "Barbell Bench Press - Medium Grip",
+    "bench press": "Barbell Bench Press - Medium Grip",
+    "incline bench": "Barbell Incline Bench Press - Medium Grip",
+    "squat": "Barbell Squat", "back squat": "Barbell Squat",
+    "front squat": "Front Barbell Squat", "deadlift": "Barbell Deadlift",
+    "pull up": "Pullups", "pull ups": "Pullups", "pullup": "Pullups",
+    "chin up": "Chin-Up", "chin ups": "Chin-Up",
+    "dip": "Dips - Triceps Version", "dips": "Dips - Triceps Version",
+    "row": "Bent Over Barbell Row", "rows": "Bent Over Barbell Row",
+    "barbell row": "Bent Over Barbell Row", "seated row": "Seated Cable Rows",
+    "lat pulldown": "Wide-Grip Lat Pulldown", "pulldown": "Wide-Grip Lat Pulldown",
+    "curl": "Barbell Curl", "curls": "Barbell Curl", "bicep curl": "Barbell Curl",
+    "hammer curl": "Hammer Curls", "tricep pushdown": "Triceps Pushdown",
+    "skullcrusher": "Lying Triceps Press", "skull crusher": "Lying Triceps Press",
+    "lateral raise": "Side Lateral Raise", "lat raise": "Side Lateral Raise",
+    "face pull": "Face Pull", "shrug": "Barbell Shrug", "shrugs": "Barbell Shrug",
+    "leg press": "Leg Press", "leg curl": "Lying Leg Curls",
+    "leg extension": "Leg Extensions", "lunge": "Dumbbell Lunges",
+    "lunges": "Dumbbell Lunges", "hip thrust": "Barbell Hip Thrust",
+    "calf raise": "Standing Calf Raises", "calves": "Standing Calf Raises",
+    "plank": "Plank", "abs": "Cable Crunch", "core": "Cable Crunch",
+    "push up": "Pushups", "push ups": "Pushups", "pushup": "Pushups",
+    "split squat": "Split Squats", "bulgarian split squat": "Split Squat with Dumbbells",
+    "rear delt fly": "Cable Rear Delt Fly", "reverse fly": "Reverse Flyes",
+    "upright row": "Standing Dumbbell Upright Row", "glute bridge": "Barbell Glute Bridge",
+    "t bar row": "T-Bar Row with Handle", "tbar row": "T-Bar Row with Handle",
+    "farmers walk": "Farmer's Walk", "farmer walk": "Farmer's Walk",
+    "leg extension": "Leg Extensions", "leg extensions": "Leg Extensions",
+    "crunch": "Crunches", "sit up": "Crunches", "situps": "Crunches",
+    "goblet squat": "Goblet Squat", "close grip bench": "Close-Grip Barbell Bench Press",
+    "military press": "Standing Military Press", "shoulder press": "Dumbbell Shoulder Press",
+    "incline press": "Incline Dumbbell Press", "cable fly": "Cable Crossover",
+    "preacher curl": "Preacher Curl", "good morning": "Good Morning",
+}
+
+
+def find_exercise_info(name):
+    """Best-effort lookup: hand-written entry, then alias, then library, then
+    a fuzzy substring match. Returns None only if nothing plausible is found."""
+    # 1. exact hand-written entry (covers your own plan's shorthand)
+    info = EXERCISE_INFO.get(base_exercise_name(name))
+    if info:
+        return info
+
+    library = load_exercise_library()
+    if not library:
+        return None
+
+    norm = _normalise_exercise_name(name)
+    if not norm:
+        return None
+
+    # 2. case-insensitive match against hand-written entries
+    for key, entry in EXERCISE_INFO.items():
+        if _normalise_exercise_name(key) == norm:
+            return entry
+
+    # 3. alias table
+    alias = EXERCISE_ALIASES.get(norm)
+    if alias and alias in library:
+        return library[alias]
+
+    # 4. exact (normalised) library match
+    norm_library = {_normalise_exercise_name(k): v for k, v in library.items()}
+    if norm in norm_library:
+        return norm_library[norm]
+
+    # 5. fuzzy: shortest library name containing the query, or vice versa
+    candidates = [(k, v) for k, v in norm_library.items() if norm in k or k in norm]
+    if candidates:
+        return min(candidates, key=lambda kv: len(kv[0]))[1]
+    return None
+
+
+def all_known_exercise_names():
+    """Sorted names for the swap picker: your plan's own entries plus the library."""
+    names = set(EXERCISE_INFO.keys()) | set(load_exercise_library().keys())
+    return sorted(names)
+
+
+def exercise_muscle_filters():
+    """Clean muscle groups for the swap filter dropdown.
+
+    Only the library's canonical labels are used. The hand-written EXERCISE_INFO
+    entries use looser wording ("Core / Abdominals", "Full body mobility") which
+    would otherwise clutter the list with near-duplicates.
+    """
+    groups = set()
+    for entry in load_exercise_library().values():
+        groups.update(entry.get("muscles", []))
+    return sorted(groups)
+
+
+def search_exercises(query="", muscle=None, limit=400):
+    """Filter the exercise catalogue by free-text query and/or muscle group.
+
+    Matching is on the normalised name, so 'db press' finds 'Dumbbell Press'
+    and case/punctuation don't matter. Results are ordered so names that START
+    with the query come first — typing 'row' should surface 'Rowing' style
+    matches before 'Bent Over Barbell Row'.
+    """
+    library = dict(load_exercise_library())
+    for k, v in EXERCISE_INFO.items():
+        library.setdefault(k, v)
+
+    q = _normalise_exercise_name(query) if query else ""
+    starts, contains = [], []
+    for name, entry in library.items():
+        if muscle and muscle not in (entry.get("muscles") or []):
+            continue
+        if q:
+            norm = _normalise_exercise_name(name)
+            if norm.startswith(q):
+                starts.append(name)
+            elif q in norm:
+                contains.append(name)
+        else:
+            contains.append(name)
+    return (sorted(starts) + sorted(contains))[:limit]
+
+
+LOG_TYPES = {
+    "weight_reps": "Weight & reps",
+    "bodyweight": "Reps only (bodyweight)",
+    "duration": "Time & distance",
+}
+
+
+def default_log_type(exercise_name):
+    """How should this movement be logged? Falls back to weight & reps.
+
+    A 20-minute incline walk has no meaningful 'kg' or 'reps', and a set of
+    pull-ups has no barbell load, so forcing every movement into the same three
+    boxes produces nonsense data.
+    """
+    info = EXERCISE_INFO.get(base_exercise_name(exercise_name)) or {}
+    return info.get("log_type", "weight_reps")
+
+
 def estimated_1rm(weight_kg, reps):
     """Epley formula. A rough estimate, useful for trend-spotting, not a max test."""
     if not weight_kg or not reps or reps < 1:
@@ -238,12 +431,14 @@ EXERCISE_INFO = {
         "images": [_FEDB + "Barbell_Incline_Bench_Press_-_Medium_Grip/0.jpg", _FEDB + "Barbell_Incline_Bench_Press_-_Medium_Grip/1.jpg"],
     },
     "Pull Ups/Pulldown": {
+        "log_type": "bodyweight",
         "muscles": ["Lats", "Biceps", "Upper Back"],
         "cues": ["Full hang at the bottom", "Pull elbows down and back, chest to the bar",
                  "Avoid excessive kipping/swinging"],
         "images": [_FEDB + "Pullups/0.jpg", _FEDB + "Pullups/1.jpg"],
     },
     "Pull Ups": {
+        "log_type": "bodyweight",
         "muscles": ["Lats", "Biceps", "Upper Back"],
         "cues": ["Full hang at the bottom, shoulders active", "Pull elbows down and back, chin over the bar",
                  "Lower under control rather than dropping"],
@@ -274,18 +469,21 @@ EXERCISE_INFO = {
         "images": [_FEDB + "Barbell_Curl/0.jpg", _FEDB + "Barbell_Curl/1.jpg"],
     },
     "Cardio": {
+        "log_type": "duration",
         "muscles": ["Heart/Lungs (conditioning)"],
         "cues": ["Warm up for a few minutes first", "Keep a pace you can sustain for the full duration",
                  "Cool down and stretch after"],
         "images": [],
     },
     "Abs": {
+        "log_type": "bodyweight",
         "muscles": ["Core / Abdominals"],
         "cues": ["Control the movement, avoid yanking with the neck", "Exhale on the contraction",
                  "Keep the lower back from over-arching"],
         "images": [_FEDB + "Cable_Crunch/0.jpg", _FEDB + "Cable_Crunch/1.jpg"],
     },
     "Stretch": {
+        "log_type": "duration",
         "muscles": ["Full body mobility"],
         "cues": ["Hold each stretch 20-30 seconds", "Breathe, don't bounce",
                  "Stretch to mild tension, not pain"],
@@ -293,30 +491,35 @@ EXERCISE_INFO = {
     },
     # --- Walking / rest entries: no demo image needed, just context ---
     "15 min incline walk": {
+        "log_type": "duration",
         "muscles": ["Calves", "Glutes", "Heart/Lungs"],
         "cues": ["Treadmill incline around 8-12%", "Comfortable pace you can hold the whole time",
                  "Don't hold the handrails — it kills the effort"],
         "images": [],
     },
     "20 min incline walk": {
+        "log_type": "duration",
         "muscles": ["Calves", "Glutes", "Heart/Lungs"],
         "cues": ["Treadmill incline around 8-12%", "Comfortable pace you can hold the whole time",
                  "Don't hold the handrails — it kills the effort"],
         "images": [],
     },
     "30-45 min walk": {
+        "log_type": "duration",
         "muscles": ["Heart/Lungs", "Legs"],
         "cues": ["Easy conversational pace", "Outdoors or treadmill both fine",
                  "Great for hitting the daily step target"],
         "images": [],
     },
     "45 min walk or football": {
+        "log_type": "duration",
         "muscles": ["Heart/Lungs", "Legs"],
         "cues": ["Keep it genuinely easy — this is recovery, not a session",
                  "If playing football, warm up properly first"],
         "images": [],
     },
     "Rest and 10k steps": {
+        "log_type": "duration",
         "muscles": ["Recovery day"],
         "cues": ["No lifting today — let the body repair", "Still aim for your step target",
                  "Prioritise sleep and hydration"],
@@ -388,7 +591,7 @@ BASE_EN = {
     "prediction_header": "📈 Weight Prediction", "prediction_30": "Projected weight in 30 days",
     "prediction_90": "Projected weight in 90 days", "prediction_insufficient": "Log a few more weight entries (at least 2, spread over time) to see a prediction.",
     "perfect_day_header": "🏆 PERFECT DAY ACHIEVED", "perfect_day_sub": "Every target hit today. Incredible work.",
-    "quote_of_day_label": "💬 Quote of the Day", "next_badge_label": "Next Badge",
+    "quote_of_day_label": "💬 Quote of the Day", "verse_of_day_label": "📖 Verse of the Day", "next_badge_label": "Next Badge",
     "todays_workout_label": "Today's Workout", "weekly_change_label": "Weekly Change",
     "current_weight_home_label": "Current Weight", "lifetime_workouts_label": "Total Workouts",
     "lifetime_steps_label": "Lifetime Steps", "lifetime_protein_label": "Lifetime Protein",
@@ -407,7 +610,17 @@ BASE_EN = {
     "form_cues_label": "Form cues",
     "no_info_label": "No demo added yet for this exercise — fill in EXERCISE_INFO to add one.",
     "swap_label": "🔄 Swap this exercise",
-    "swap_placeholder": "e.g. Pull Ups",
+    "swap_placeholder": "…or type any exercise name",
+    "swap_help": "Search or filter, then pick — you'll get demo photos and form cues. "
+                 "Or type a name that isn't listed and hit Swap anyway.",
+    "swap_pick_placeholder": "— choose a replacement —",
+    "swap_search_label": "Search exercises",
+    "swap_search_placeholder": "e.g. dip, row, curl…",
+    "swap_muscle_label": "Filter by muscle", "swap_all_muscles": "All muscles",
+    "swap_matches_suffix": "matches — pick one below",
+    "swap_no_matches": "Nothing matched. Clear the filters, or just hit Swap to use "
+                       "exactly what you typed.",
+    "no_demo_for_swap": "No demo found for this name. Try picking from the list above.",
     "swap_confirm": "Swap",
     "revert_swap_label": "↩ Revert to original",
     "swapped_from_label": "Swapped from",
@@ -418,6 +631,13 @@ BASE_EN = {
     "last_time_label": "Last time", "no_history_label": "No history yet for this lift",
     "session_volume_label": "Session volume", "e1rm_label": "Est. 1RM",
     "exercise_note_label": "Note for this exercise",
+    "log_type_label": "How do you log this?",
+    "per_side_label": "Weight is per hand (dumbbells)",
+    "per_side_help": "Tick this if you hold the weight in each hand — e.g. 22kg dumbbells "
+                     "means 44kg total load. Enter the weight of ONE dumbbell.",
+    "weight_each_label": "kg (each)",
+    "duration_label": "Minutes", "distance_label": "Distance (km)",
+    "total_time_label": "Total time", "total_distance_label": "Distance",
     # --- rest timer ---
     "rest_timer_label": "⏱ Rest timer", "start_timer": "Start",
     # --- tabs ---
@@ -775,6 +995,16 @@ def get_conn():
         log_date TEXT, exercise TEXT, set_number INTEGER,
         reps INTEGER DEFAULT 0, weight_kg REAL DEFAULT 0,
         PRIMARY KEY (log_date, exercise, set_number))""")
+    # Cardio/walks are time-and-distance, not weight-and-reps. Added as separate
+    # columns so existing rows are untouched.
+    for _col, _type in (("duration_min", "REAL"), ("distance_km", "REAL")):
+        try:
+            cur.execute(f"ALTER TABLE exercise_sets ADD COLUMN IF NOT EXISTS {_col} {_type} DEFAULT 0")
+        except Exception:
+            pass
+    # How each movement is logged, and whether the weight entered is per-hand.
+    cur.execute("""CREATE TABLE IF NOT EXISTS exercise_prefs (
+        exercise TEXT PRIMARY KEY, log_type TEXT, per_side INTEGER DEFAULT 0)""")
     # NEW: free-text note per exercise per day ("left shoulder tight")
     cur.execute("""CREATE TABLE IF NOT EXISTS exercise_notes (
         log_date TEXT, exercise TEXT, note TEXT DEFAULT '',
@@ -1090,19 +1320,55 @@ def reset_plan_day(weekday):
 # SETS / REPS / WEIGHT  (the actual training log)
 # ---------------------------------------------------------------
 def get_sets(log_date, exercise):
-    """Returns [{'set_number':1,'reps':8,'weight_kg':80.0}, ...] ordered by set number."""
-    cols, rows = fetch("""SELECT set_number, reps, weight_kg FROM exercise_sets
+    """Ordered list of sets, including duration/distance for cardio-style entries."""
+    cols, rows = fetch("""SELECT set_number, reps, weight_kg,
+                                 COALESCE(duration_min,0), COALESCE(distance_km,0)
+                          FROM exercise_sets
                           WHERE log_date=%s AND exercise=%s ORDER BY set_number""",
                        (log_date, exercise))
-    return [{"set_number": r[0], "reps": r[1] or 0, "weight_kg": r[2] or 0.0} for r in rows]
+    return [{"set_number": r[0], "reps": r[1] or 0, "weight_kg": r[2] or 0.0,
+             "duration_min": r[3] or 0.0, "distance_km": r[4] or 0.0} for r in rows]
 
 
-def save_set(log_date, exercise, set_number, reps, weight_kg):
-    run("""INSERT INTO exercise_sets (log_date, exercise, set_number, reps, weight_kg)
-           VALUES (%s, %s, %s, %s, %s)
+def save_set(log_date, exercise, set_number, reps, weight_kg,
+             duration_min=0, distance_km=0):
+    run("""INSERT INTO exercise_sets
+             (log_date, exercise, set_number, reps, weight_kg, duration_min, distance_km)
+           VALUES (%s, %s, %s, %s, %s, %s, %s)
            ON CONFLICT (log_date, exercise, set_number) DO UPDATE SET
-           reps=excluded.reps, weight_kg=excluded.weight_kg""",
-        (log_date, exercise, set_number, int(reps or 0), float(weight_kg or 0)))
+           reps=excluded.reps, weight_kg=excluded.weight_kg,
+           duration_min=excluded.duration_min, distance_km=excluded.distance_km""",
+        (log_date, exercise, set_number, int(reps or 0), float(weight_kg or 0),
+         float(duration_min or 0), float(distance_km or 0)))
+
+
+# ---------------------------------------------------------------
+# PER-EXERCISE LOGGING PREFERENCES
+# ---------------------------------------------------------------
+def get_exercise_pref(exercise):
+    """How to log this movement, and whether the weight entered is per-hand.
+
+    Defaults come from EXERCISE_INFO, but the user can override per exercise and
+    the choice sticks for every future session.
+    """
+    cols, rows = fetch("SELECT log_type, per_side FROM exercise_prefs WHERE exercise=%s",
+                       (exercise,))
+    if rows:
+        return {"log_type": rows[0][0] or default_log_type(exercise),
+                "per_side": bool(rows[0][1])}
+    return {"log_type": default_log_type(exercise), "per_side": False}
+
+
+def set_exercise_pref(exercise, log_type, per_side):
+    run("""INSERT INTO exercise_prefs (exercise, log_type, per_side) VALUES (%s, %s, %s)
+           ON CONFLICT (exercise) DO UPDATE SET
+           log_type=excluded.log_type, per_side=excluded.per_side""",
+        (exercise, log_type, int(bool(per_side))))
+
+
+def effective_load(weight_kg, per_side):
+    """Total load actually moved. 22kg dumbbells in each hand = 44kg on the body."""
+    return float(weight_kg or 0) * (2 if per_side else 1)
 
 
 def delete_last_set(log_date, exercise):
@@ -1479,21 +1745,66 @@ def generate_coach_notes(log_date_str, weekday, targets):
 
     return lines, focus
 
-QUOTES = [
-    "Discipline is choosing between what you want now and what you want most.",
-    "Small steps every day lead to big results over time.",
-    "You don't have to be extreme, just consistent.",
-    "The only bad workout is the one that didn't happen.",
-    "Progress, not perfection.",
-    "Your future self is watching you right now through memories.",
-    "Motivation gets you started. Habit keeps you going.",
-    "Every rep counts, every meal matters, every day adds up.",
-    "The body achieves what the mind believes.",
-    "Consistency beats intensity every single time.",
+# Quote + a thematically matching verse for each day.
+# Verses are from the World English Bible (WEB), which is public domain.
+DAILY_INSPIRATION = [
+    {"quote": "Discipline is choosing between what you want now and what you want most.",
+     "verse": "Every man who strives in the games exercises self-control in all things.",
+     "ref": "1 Corinthians 9:25 (WEB)"},
+    {"quote": "Small steps every day lead to big results over time.",
+     "verse": "Indeed, who despises the day of small things?",
+     "ref": "Zechariah 4:10 (WEB)"},
+    {"quote": "You don't have to be extreme, just consistent.",
+     "verse": "Let's not be weary in doing good, for we will reap in due season, if we don't give up.",
+     "ref": "Galatians 6:9 (WEB)"},
+    {"quote": "The only bad workout is the one that didn't happen.",
+     "verse": "In all hard work there is profit, but the talk of the lips leads only to poverty.",
+     "ref": "Proverbs 14:23 (WEB)"},
+    {"quote": "Progress, not perfection.",
+     "verse": "Forgetting the things which are behind, and stretching forward to the things which are before, I press on toward the goal.",
+     "ref": "Philippians 3:13-14 (WEB)"},
+    {"quote": "Your future self is watching you right now through memories.",
+     "verse": "The plans of the diligent surely lead to profit.",
+     "ref": "Proverbs 21:5 (WEB)"},
+    {"quote": "Motivation gets you started. Habit keeps you going.",
+     "verse": "Whatever you do, work heartily, as for the Lord, and not for men.",
+     "ref": "Colossians 3:23 (WEB)"},
+    {"quote": "Every rep counts, every meal matters, every day adds up.",
+     "verse": "He who is faithful in a very little is faithful also in much.",
+     "ref": "Luke 16:10 (WEB)"},
+    {"quote": "The body achieves what the mind believes.",
+     "verse": "I can do all things through Christ, who strengthens me.",
+     "ref": "Philippians 4:13 (WEB)"},
+    {"quote": "Consistency beats intensity every single time.",
+     "verse": "Run like that, that you may win.",
+     "ref": "1 Corinthians 9:24 (WEB)"},
+    {"quote": "Rest is part of the work, not a break from it.",
+     "verse": "Come away into a deserted place, and rest a while.",
+     "ref": "Mark 6:31 (WEB)"},
+    {"quote": "Show up on the days you don't feel like it.",
+     "verse": "Those who wait for Yahweh will renew their strength. They will mount up with wings like eagles.",
+     "ref": "Isaiah 40:31 (WEB)"},
+    {"quote": "Your body is worth taking care of.",
+     "verse": "Don't you know that your body is a temple of the Holy Spirit? Therefore glorify God in your body.",
+     "ref": "1 Corinthians 6:19-20 (WEB)"},
+    {"quote": "Strength is built under load, not in comfort.",
+     "verse": "The testing of your faith produces endurance. Let endurance have its perfect work.",
+     "ref": "James 1:3-4 (WEB)"},
 ]
 
+# Kept for backwards compatibility with anything referencing QUOTES directly.
+QUOTES = [item["quote"] for item in DAILY_INSPIRATION]
+
+
+def get_daily_inspiration():
+    """Same pairing every day, rotating through the list — so the quote and the
+    verse always share a theme rather than being picked independently."""
+    return DAILY_INSPIRATION[date.today().toordinal() % len(DAILY_INSPIRATION)]
+
+
 def get_daily_quote():
-    return QUOTES[date.today().toordinal() % len(QUOTES)]
+    return get_daily_inspiration()["quote"]
+
 
 # ---------------------------------------------------------------
 # STRENGTH: PRs, estimated 1RM trend, muscle volume
@@ -1506,11 +1817,15 @@ def get_lift_prs(limit=12):
     cols, rows = fetch("""SELECT exercise, reps, weight_kg, log_date FROM exercise_sets
                           WHERE weight_kg > 0 AND reps > 0""")
     best = {}
+    per_side_cache = {}
     for exercise, reps, weight, log_date in rows:
-        e1rm = estimated_1rm(weight, reps)
+        if exercise not in per_side_cache:
+            per_side_cache[exercise] = get_exercise_pref(exercise)["per_side"]
+        load = effective_load(weight, per_side_cache[exercise])
+        e1rm = estimated_1rm(load, reps)
         cur = best.get(exercise)
         if cur is None or e1rm > cur["e1rm"]:
-            best[exercise] = {"exercise": exercise, "weight_kg": float(weight),
+            best[exercise] = {"exercise": exercise, "weight_kg": load,
                               "reps": int(reps), "e1rm": e1rm, "log_date": log_date}
     ranked = sorted(best.values(), key=lambda r: r["e1rm"], reverse=True)
     return ranked[:limit]
@@ -1523,32 +1838,39 @@ def get_strength_trend(exercise):
                           ORDER BY log_date""", (exercise,))
     if not rows:
         return pd.DataFrame()
+    per_side = get_exercise_pref(exercise)["per_side"]
     per_day = {}
     for log_date, reps, weight in rows:
-        e1rm = estimated_1rm(weight, reps)
+        load = effective_load(weight, per_side)
+        e1rm = estimated_1rm(load, reps)
         if log_date not in per_day or e1rm > per_day[log_date]["e1rm"]:
             per_day[log_date] = {"log_date": log_date, "e1rm": round(e1rm, 1),
-                                 "top_weight": float(weight)}
+                                 "top_weight": load}
     df = pd.DataFrame(sorted(per_day.values(), key=lambda r: r["log_date"]))
     df["log_date"] = pd.to_datetime(df["log_date"])
     return df
 
 
 def get_muscle_volume_for_range(start, end):
-    """Total kg-volume (weight x reps) per canonical muscle region.
+    """Total kg-volume (load x reps) per canonical muscle region.
 
     Volume from a multi-muscle lift is credited in full to each region it hits,
     so these numbers show relative emphasis rather than a strict kg total.
+    Per-hand dumbbell loads are doubled; time-based entries contribute nothing.
     """
     df = get_sets_for_range(start, end)
     totals = {region: 0.0 for region in MUSCLE_REGIONS}
     if df.empty:
         return totals
+    per_side_cache = {}
     for _, r in df.iterrows():
-        vol = float(r["weight_kg"] or 0) * int(r["reps"] or 0)
+        ex = r["exercise"]
+        if ex not in per_side_cache:
+            per_side_cache[ex] = get_exercise_pref(ex)["per_side"]
+        vol = effective_load(r["weight_kg"], per_side_cache[ex]) * int(r["reps"] or 0)
         if vol <= 0:
             continue
-        for region in muscle_regions_for(r["exercise"]):
+        for region in muscle_regions_for(ex):
             totals[region] += vol
     return totals
 
@@ -1563,21 +1885,58 @@ def get_total_volume_for_range(start, end):
     df = get_sets_for_range(start, end)
     if df.empty:
         return 0.0
-    return float((df["weight_kg"].fillna(0) * df["reps"].fillna(0)).sum())
+    per_side_cache = {}
+    total = 0.0
+    for _, r in df.iterrows():
+        ex = r["exercise"]
+        if ex not in per_side_cache:
+            per_side_cache[ex] = get_exercise_pref(ex)["per_side"]
+        total += effective_load(r["weight_kg"], per_side_cache[ex]) * int(r["reps"] or 0)
+    return total
 
 
 def get_session_volume(log_date, exercise):
-    return sum(float(s["weight_kg"] or 0) * int(s["reps"] or 0) for s in get_sets(log_date, exercise))
+    per_side = get_exercise_pref(exercise)["per_side"]
+    return sum(effective_load(s["weight_kg"], per_side) * int(s["reps"] or 0)
+               for s in get_sets(log_date, exercise))
 
 
-def format_set_summary(sets):
-    """'80kg x 8, 80kg x 7, 75kg x 8' — compact enough to sit under a heading."""
+def get_session_duration(log_date, exercise):
+    """Total minutes and km logged for a time-based movement."""
+    sets = get_sets(log_date, exercise)
+    return (sum(float(s["duration_min"] or 0) for s in sets),
+            sum(float(s["distance_km"] or 0) for s in sets))
+
+
+def format_set_summary(sets, per_side=False):
+    """Compact one-liner, shaped to how the movement is actually logged.
+
+    '80kg × 8, 80kg × 7'          — barbell
+    '22kg ×2 × 8'                 — dumbbells, per hand
+    'BW × 10'                     — bodyweight
+    '25 min · 3.2 km'             — cardio
+    """
     parts = []
     for s in sets:
+        dur = float(s.get("duration_min") or 0)
+        dist = float(s.get("distance_km") or 0)
+        if dur or dist:
+            bits = []
+            if dur:
+                bits.append(f"{dur:g} min")
+            if dist:
+                bits.append(f"{dist:g} km")
+            parts.append(" · ".join(bits))
+            continue
         w, r = s["weight_kg"], s["reps"]
         if not r:
             continue
-        parts.append(f"{w:g}kg × {r}" if w else f"BW × {r}")
+        if w and per_side:
+            parts.append(f"{w:g}kg ×2 × {r}")
+        elif w:
+            parts.append(f"{w:g}kg × {r}")
+        else:
+            parts.append(f"BW × {r}")
     return ", ".join(parts)
 # ---------------------------------------------------------------
 # GYM BRO (AI chatbot — free Gemini API)
@@ -2105,6 +2464,28 @@ def get_bottle_message(pct):
     else:
         return t("bottle_0")
 
+def render_exercise_demo(info, display_name):
+    """Demo photos + target muscles + form cues for one exercise."""
+    if not info:
+        st.caption(t("no_info_label"))
+        return
+    imgs = info.get("images") or []
+    if imgs:
+        img_cols = st.columns(len(imgs))
+        phase_labels = ["Start position", "End position"]
+        for i, (c, img_url) in enumerate(zip(img_cols, imgs)):
+            with c:
+                st.image(img_url,
+                         caption=phase_labels[i] if i < len(phase_labels) else f"Step {i+1}",
+                         use_container_width=True)
+    if info.get("muscles"):
+        st.markdown(f"**{t('muscles_targeted_label')}:** " + ", ".join(info["muscles"]))
+    if info.get("cues"):
+        st.markdown(f"**{t('form_cues_label')}:**")
+        for cue in info["cues"]:
+            st.markdown(f"- {cue}")
+
+
 def render_rest_timer(seconds, key_suffix):
     """Self-contained countdown that runs in the browser, so it keeps ticking
     without Streamlit reruns. Beeps at zero using the same WebAudio trick as
@@ -2301,8 +2682,17 @@ if page == t("nav_home"):
     streak, longest, total_days = compute_streak_stats()
     score = compute_momentum_score(today_str, weekday, TARGETS)
 
+    inspiration = get_daily_inspiration()
     st.caption(t("quote_of_day_label"))
-    st.markdown(f"*{get_daily_quote()}*")
+    st.markdown(f"*{inspiration['quote']}*")
+    st.markdown(
+        f"<div style='border-left:3px solid #3b82f6;padding:6px 0 6px 12px;"
+        f"margin:8px 0 4px 0;'>"
+        f"<div style='font-size:0.92rem;font-style:italic;color:#c9d3de;'>"
+        f"&ldquo;{inspiration['verse']}&rdquo;</div>"
+        f"<div style='font-size:0.76rem;color:#8b95a1;margin-top:4px;'>"
+        f"{inspiration['ref']}</div></div>",
+        unsafe_allow_html=True)
 
     h1, h2 = st.columns(2)
     with h1:
@@ -2422,13 +2812,13 @@ elif page == t("nav_today"):
             # "Last time" hint — the single most useful thing mid-workout
             prev_date, prev_sets = get_last_session(effective_name, log_date_str)
             if prev_sets:
-                summary = format_set_summary(prev_sets)
+                summary = format_set_summary(
+                    prev_sets, per_side=get_exercise_pref(effective_name)["per_side"])
                 if summary:
                     st.caption(f"↩ {t('last_time_label')} ({prev_date}): {summary}")
 
             with st.expander(f"{t('exercise_info_label')} — {effective_name}", expanded=False):
-                info_key = base_exercise_name(effective_name)
-                info = EXERCISE_INFO.get(info_key)
+                info = find_exercise_info(effective_name)
 
                 if swap:
                     st.caption(f"{t('swapped_from_label')}: {ex}")
@@ -2436,29 +2826,84 @@ elif page == t("nav_today"):
                         remove_exercise_swap(log_date_str, ex)
                         st.rerun()
 
-                # ---------------- SETS / REPS / WEIGHT ----------------
+                # ---------------- HOW THIS MOVEMENT IS LOGGED ----------------
+                pref = get_exercise_pref(effective_name)
+                type_keys = list(LOG_TYPES.keys())
+                chosen_type = st.selectbox(
+                    t("log_type_label"), type_keys,
+                    index=type_keys.index(pref["log_type"]) if pref["log_type"] in type_keys else 0,
+                    format_func=lambda k: LOG_TYPES[k],
+                    key=f"logtype_{log_date_str}_{effective_name}")
+
+                per_side = pref["per_side"]
+                if chosen_type == "weight_reps":
+                    per_side = st.checkbox(
+                        t("per_side_label"), value=pref["per_side"],
+                        help=t("per_side_help"),
+                        key=f"perside_{log_date_str}_{effective_name}")
+
+                if (chosen_type, per_side) != (pref["log_type"], pref["per_side"]):
+                    set_exercise_pref(effective_name, chosen_type, per_side)
+                    st.rerun()
+
+                # ---------------- THE SETS THEMSELVES ----------------
                 st.markdown(f"**{t('sets_header')}**")
                 sets = get_sets(log_date_str, effective_name)
                 if not sets:
-                    sets = [{"set_number": 1, "reps": 0, "weight_kg": 0.0}]
+                    sets = [{"set_number": 1, "reps": 0, "weight_kg": 0.0,
+                             "duration_min": 0.0, "distance_km": 0.0}]
 
-                for s in sets:
-                    sc1, sc2, sc3 = st.columns([1, 2, 2])
-                    with sc1:
-                        st.markdown(
-                            f"<div style='padding-top:32px;color:#9aa5b1;font-size:0.8rem;'>"
-                            f"{t('set_label')} {s['set_number']}</div>", unsafe_allow_html=True)
-                    with sc2:
-                        w = st.number_input(
-                            t("weight_kg_label"), min_value=0.0, step=2.5,
-                            value=float(s["weight_kg"] or 0),
-                            key=f"w_{log_date_str}_{effective_name}_{s['set_number']}")
-                    with sc3:
-                        r = st.number_input(
-                            t("reps_label"), min_value=0, step=1, value=int(s["reps"] or 0),
-                            key=f"r_{log_date_str}_{effective_name}_{s['set_number']}")
-                    if (w, r) != (s["weight_kg"], s["reps"]):
-                        save_set(log_date_str, effective_name, s["set_number"], r, w)
+                for sset in sets:
+                    n = sset["set_number"]
+                    kbase = f"{log_date_str}_{effective_name}_{n}"
+
+                    if chosen_type == "duration":
+                        dc1, dc2, dc3 = st.columns([1, 2, 2])
+                        with dc1:
+                            st.markdown(
+                                f"<div style='padding-top:32px;color:#9aa5b1;font-size:0.8rem;'>"
+                                f"#{n}</div>", unsafe_allow_html=True)
+                        with dc2:
+                            dur = st.number_input(t("duration_label"), min_value=0.0, step=5.0,
+                                                  value=float(sset.get("duration_min") or 0),
+                                                  key=f"dur_{kbase}")
+                        with dc3:
+                            dist = st.number_input(t("distance_label"), min_value=0.0, step=0.1,
+                                                   value=float(sset.get("distance_km") or 0),
+                                                   key=f"dist_{kbase}")
+                        if (dur, dist) != (sset.get("duration_min"), sset.get("distance_km")):
+                            save_set(log_date_str, effective_name, n, 0, 0, dur, dist)
+
+                    elif chosen_type == "bodyweight":
+                        bc1, bc2 = st.columns([1, 4])
+                        with bc1:
+                            st.markdown(
+                                f"<div style='padding-top:32px;color:#9aa5b1;font-size:0.8rem;'>"
+                                f"{t('set_label')} {n}</div>", unsafe_allow_html=True)
+                        with bc2:
+                            r = st.number_input(t("reps_label"), min_value=0, step=1,
+                                                value=int(sset["reps"] or 0), key=f"r_{kbase}")
+                        if r != sset["reps"]:
+                            save_set(log_date_str, effective_name, n, r, 0)
+
+                    else:  # weight_reps
+                        sc1, sc2, sc3 = st.columns([1, 2, 2])
+                        with sc1:
+                            st.markdown(
+                                f"<div style='padding-top:32px;color:#9aa5b1;font-size:0.8rem;'>"
+                                f"{t('set_label')} {n}</div>", unsafe_allow_html=True)
+                        with sc2:
+                            w = st.number_input(
+                                t("weight_each_label") if per_side else t("weight_kg_label"),
+                                min_value=0.0, step=2.5,
+                                value=float(sset["weight_kg"] or 0), key=f"w_{kbase}")
+                        with sc3:
+                            r = st.number_input(t("reps_label"), min_value=0, step=1,
+                                                value=int(sset["reps"] or 0), key=f"r_{kbase}")
+                        if (w, r) != (sset["weight_kg"], sset["reps"]):
+                            save_set(log_date_str, effective_name, n, r, w)
+                        if per_side and w:
+                            st.caption(f"= {effective_load(w, True):g} kg total")
 
                 ac1, ac2 = st.columns(2)
                 with ac1:
@@ -2473,13 +2918,22 @@ elif page == t("nav_today"):
                         delete_last_set(log_date_str, effective_name)
                         st.rerun()
 
-                vol = get_session_volume(log_date_str, effective_name)
-                best = max((estimated_1rm(s["weight_kg"], s["reps"])
-                            for s in get_sets(log_date_str, effective_name)), default=0)
-                if vol > 0:
-                    v1, v2 = st.columns(2)
-                    v1.metric(t("session_volume_label"), f"{vol:,.0f} kg")
-                    v2.metric(t("e1rm_label"), f"{best:.1f} kg")
+                # ---------------- SESSION SUMMARY ----------------
+                if chosen_type == "duration":
+                    mins, km = get_session_duration(log_date_str, effective_name)
+                    if mins or km:
+                        d1, d2 = st.columns(2)
+                        d1.metric(t("total_time_label"), f"{mins:g} min")
+                        d2.metric(t("total_distance_label"), f"{km:g} km")
+                else:
+                    vol = get_session_volume(log_date_str, effective_name)
+                    if vol > 0:
+                        best = max((estimated_1rm(effective_load(x["weight_kg"], per_side), x["reps"])
+                                    for x in get_sets(log_date_str, effective_name)), default=0)
+                        v1, v2 = st.columns(2)
+                        v1.metric(t("session_volume_label"), f"{vol:,.0f} kg")
+                        if best > 0:
+                            v2.metric(t("e1rm_label"), f"{best:.1f} kg")
 
                 note = st.text_input(
                     t("exercise_note_label"), value=get_exercise_note(log_date_str, effective_name),
@@ -2487,40 +2941,53 @@ elif page == t("nav_today"):
                 if note != get_exercise_note(log_date_str, effective_name):
                     set_exercise_note(log_date_str, effective_name, note)
 
+                st.markdown("---")
                 # ---------------- DEMO / FORM ----------------
                 st.markdown("---")
                 if info:
-                    imgs = info.get("images") or []
-                    if imgs:
-                        img_cols = st.columns(len(imgs))
-                        phase_labels = ["Start position", "End position"]
-                        for i, (c, img_url) in enumerate(zip(img_cols, imgs)):
-                            with c:
-                                st.image(
-                                    img_url,
-                                    caption=phase_labels[i] if i < len(phase_labels) else f"Step {i+1}",
-                                    use_container_width=True)
-                    if info.get("muscles"):
-                        st.markdown(f"**{t('muscles_targeted_label')}:** " + ", ".join(info["muscles"]))
-                    if info.get("cues"):
-                        st.markdown(f"**{t('form_cues_label')}:**")
-                        for cue in info["cues"]:
-                            st.markdown(f"- {cue}")
+                    render_exercise_demo(info, effective_name)
                 else:
-                    st.caption(t("no_info_label"))
+                    st.caption(t("no_demo_for_swap") if swap else t("no_info_label"))
 
                 st.markdown(f"**{t('swap_label')}**")
-                sw1, sw2 = st.columns([3, 1])
-                with sw1:
-                    new_name = st.text_input(
-                        t("swap_placeholder"), value="", key=f"swap_input_{log_date_str}_{ex}",
-                        label_visibility="collapsed", placeholder=t("swap_placeholder"))
-                with sw2:
-                    if st.button(t("swap_confirm"), key=f"swap_btn_{log_date_str}_{ex}",
-                                 use_container_width=True):
-                        if new_name.strip():
-                            set_exercise_swap(log_date_str, ex, new_name.strip())
-                            st.rerun()
+                st.caption(t("swap_help"))
+                # Picking from the known list means the swapped exercise still
+                # gets its demo images, muscles and cues. Free text still works,
+                # and is matched fuzzily against the library.
+                # Search + muscle filter narrow the dropdown, so you don't have
+                # to scroll a 370-item list on a phone.
+                f1, f2 = st.columns([3, 2])
+                with f1:
+                    swap_query = st.text_input(
+                        t("swap_search_label"), value="",
+                        placeholder=t("swap_search_placeholder"),
+                        key=f"swap_q_{log_date_str}_{ex}")
+                with f2:
+                    muscle_opts = [t("swap_all_muscles")] + exercise_muscle_filters()
+                    swap_muscle = st.selectbox(
+                        t("swap_muscle_label"), muscle_opts, index=0,
+                        key=f"swap_m_{log_date_str}_{ex}")
+
+                muscle_filter = None if swap_muscle == t("swap_all_muscles") else swap_muscle
+                matches = search_exercises(swap_query, muscle_filter)
+
+                if not matches:
+                    st.caption(t("swap_no_matches"))
+                    picked_swap = None
+                else:
+                    st.caption(f"{len(matches)} {t('swap_matches_suffix')}")
+                    picked_swap = st.selectbox(
+                        t("swap_label"), matches, index=0, label_visibility="collapsed",
+                        key=f"swap_pick_{log_date_str}_{ex}")
+
+                if st.button(t("swap_confirm"), key=f"swap_btn_{log_date_str}_{ex}",
+                             type="primary", use_container_width=True):
+                    # A typed query that matched nothing is still honoured — you
+                    # might be logging something the library has never heard of.
+                    chosen_swap = picked_swap or swap_query.strip()
+                    if chosen_swap:
+                        set_exercise_swap(log_date_str, ex, chosen_swap)
+                        st.rerun()
 
         # ---- Extra exercises (anything beyond today's plan) ----
         st.markdown(f"##### {t('extra_exercises_header')}")
@@ -2538,6 +3005,10 @@ elif page == t("nav_today"):
                 if st.button(t("delete_label"), key=f"extra_del_{log_date_str}_{name}"):
                     remove_exercise(log_date_str, name)
                     st.rerun()
+            extra_info = find_exercise_info(name)
+            if extra_info:
+                with st.expander(f"{t('exercise_info_label')} — {name}", expanded=False):
+                    render_exercise_demo(extra_info, name)
 
         new_extra_col1, new_extra_col2 = st.columns([4, 1])
         with new_extra_col1:
