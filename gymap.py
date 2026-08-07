@@ -434,6 +434,8 @@ BASE_EN = {
     "lift_prs_header": "🏋️ Lift Records", "strength_trend_header": "📈 Strength Trend",
     "pick_lift_label": "Pick a lift", "muscle_volume_header": "💪 Weekly Muscle Volume",
     "muscle_volume_caption": "Total kg lifted per muscle region this week",
+    "total_volume_label": "Total lifted this week",
+    "volume_overlap_note": "Muscle figures overlap — a bench press counts toward chest, shoulders and triceps, so they add up to more than the total.",
     "no_volume_yet": "Log some sets with weights to see your muscle volume breakdown.",
     # --- export ---
     "export_header": "📤 Export Data", "export_caption": "Download your logs as CSV.",
@@ -1551,6 +1553,19 @@ def get_muscle_volume_for_range(start, end):
     return totals
 
 
+def get_total_volume_for_range(start, end):
+    """True total kg lifted (weight x reps), counting each set exactly once.
+
+    Deliberately NOT the sum of the per-muscle figures: a multi-muscle lift is
+    credited in full to every region it hits, so adding those up would roughly
+    triple the real number.
+    """
+    df = get_sets_for_range(start, end)
+    if df.empty:
+        return 0.0
+    return float((df["weight_kg"].fillna(0) * df["reps"].fillna(0)).sum())
+
+
 def get_session_volume(log_date, exercise):
     return sum(float(s["weight_kg"] or 0) * int(s["reps"] or 0) for s in get_sets(log_date, exercise))
 
@@ -2155,10 +2170,13 @@ def render_rest_timer(seconds, key_suffix):
 
 
 def render_muscle_heatmap(volume_by_region):
-    """Front/back body silhouette with muscle regions shaded by training volume.
+    """Body map with a compact colour-swatch legend beside it.
 
-    Deliberately schematic rather than anatomical — the point is at-a-glance
-    'what have I hammered and what have I neglected this week'.
+    Layout note: the silhouette and the legend are two native Streamlit columns
+    rather than one HTML block. On desktop they sit side by side (the original
+    look); on a phone Streamlit stacks columns automatically, so the legend
+    drops neatly underneath instead of being clipped by the SVG iframe's fixed
+    height — which is what was cutting the numbers off before.
     """
     max_vol = max(volume_by_region.values()) if volume_by_region else 0
     if max_vol <= 0:
@@ -2172,74 +2190,75 @@ def render_muscle_heatmap(volume_by_region):
         # pale blue -> hot violet as volume climbs
         r = int(59 + (139 - 59) * ratio)
         g = int(130 + (92 - 130) * ratio)
-        b = int(246 + (246 - 246) * ratio)
+        b = 246
         alpha = 0.28 + 0.72 * ratio
         return f"rgba({r},{g},{b},{alpha:.2f})"
 
-    legend = ""
-    for region in MUSCLE_REGIONS:
-        v = volume_by_region.get(region, 0)
-        legend += (
-            f'<div style="display:flex;align-items:center;gap:6px;font-size:0.72rem;">'
-            f'<span style="width:11px;height:11px;border-radius:3px;background:{shade(region)};'
-            f'display:inline-block;border:1px solid rgba(147,163,184,0.35);"></span>'
-            f'<span style="color:#9aa5b1;">{region}</span>'
-            f'<span style="margin-left:auto;font-weight:600;color:#e6edf3;">{v:,.0f}</span></div>'
-        )
+    map_col, legend_col = st.columns([3, 2])
 
-    html = f"""
-    <div style="display:flex;gap:18px;align-items:flex-start;flex-wrap:wrap;
-                font-family:-apple-system,'Segoe UI',sans-serif;">
-      <svg width="290" height="300" viewBox="0 0 290 300">
-        <!-- ============ FRONT ============ -->
-        <text x="62" y="14" font-size="10" fill="#9aa5b1" text-anchor="middle">FRONT</text>
-        <circle cx="62" cy="36" r="13" fill="rgba(147,163,184,0.22)"/>
-        <rect x="52" y="50" width="20" height="8" rx="3" fill="rgba(147,163,184,0.22)"/>
-        <!-- shoulders -->
-        <circle cx="40" cy="66" r="11" fill="{shade('Shoulders')}"/>
-        <circle cx="84" cy="66" r="11" fill="{shade('Shoulders')}"/>
-        <!-- chest -->
-        <rect x="43" y="60" width="38" height="26" rx="7" fill="{shade('Chest')}"/>
-        <!-- core -->
-        <rect x="47" y="88" width="30" height="34" rx="6" fill="{shade('Core')}"/>
-        <!-- biceps -->
-        <rect x="26" y="76" width="13" height="34" rx="6" fill="{shade('Biceps')}"/>
-        <rect x="85" y="76" width="13" height="34" rx="6" fill="{shade('Biceps')}"/>
-        <!-- quads -->
-        <rect x="45" y="126" width="16" height="52" rx="7" fill="{shade('Quads')}"/>
-        <rect x="63" y="126" width="16" height="52" rx="7" fill="{shade('Quads')}"/>
-        <!-- calves (front view lower leg) -->
-        <rect x="47" y="182" width="12" height="42" rx="6" fill="{shade('Calves')}"/>
-        <rect x="65" y="182" width="12" height="42" rx="6" fill="{shade('Calves')}"/>
+    with map_col:
+        html = f"""
+        <div style="display:flex;justify-content:center;">
+          <svg viewBox="0 0 290 250" width="100%" style="max-width:330px;height:auto;"
+               preserveAspectRatio="xMidYMid meet">
+            <!-- ============ FRONT ============ -->
+            <text x="62" y="12" font-size="9" fill="#9aa5b1" text-anchor="middle">FRONT</text>
+            <circle cx="62" cy="34" r="13" fill="rgba(147,163,184,0.22)"/>
+            <rect x="52" y="48" width="20" height="8" rx="3" fill="rgba(147,163,184,0.22)"/>
+            <circle cx="40" cy="64" r="11" fill="{shade('Shoulders')}"/>
+            <circle cx="84" cy="64" r="11" fill="{shade('Shoulders')}"/>
+            <rect x="43" y="58" width="38" height="26" rx="7" fill="{shade('Chest')}"/>
+            <rect x="47" y="86" width="30" height="34" rx="6" fill="{shade('Core')}"/>
+            <rect x="26" y="74" width="13" height="34" rx="6" fill="{shade('Biceps')}"/>
+            <rect x="85" y="74" width="13" height="34" rx="6" fill="{shade('Biceps')}"/>
+            <rect x="45" y="124" width="16" height="52" rx="7" fill="{shade('Quads')}"/>
+            <rect x="63" y="124" width="16" height="52" rx="7" fill="{shade('Quads')}"/>
+            <rect x="47" y="180" width="12" height="42" rx="6" fill="{shade('Calves')}"/>
+            <rect x="65" y="180" width="12" height="42" rx="6" fill="{shade('Calves')}"/>
 
-        <!-- ============ BACK ============ -->
-        <text x="205" y="14" font-size="10" fill="#9aa5b1" text-anchor="middle">BACK</text>
-        <circle cx="205" cy="36" r="13" fill="rgba(147,163,184,0.22)"/>
-        <rect x="195" y="50" width="20" height="8" rx="3" fill="rgba(147,163,184,0.22)"/>
-        <!-- rear delts -->
-        <circle cx="183" cy="66" r="11" fill="{shade('Shoulders')}"/>
-        <circle cx="227" cy="66" r="11" fill="{shade('Shoulders')}"/>
-        <!-- back / lats -->
-        <rect x="186" y="60" width="38" height="46" rx="7" fill="{shade('Back')}"/>
-        <!-- triceps -->
-        <rect x="169" y="76" width="13" height="34" rx="6" fill="{shade('Triceps')}"/>
-        <rect x="228" y="76" width="13" height="34" rx="6" fill="{shade('Triceps')}"/>
-        <!-- glutes -->
-        <rect x="188" y="110" width="34" height="20" rx="8" fill="{shade('Glutes')}"/>
-        <!-- hamstrings -->
-        <rect x="188" y="134" width="16" height="46" rx="7" fill="{shade('Hamstrings')}"/>
-        <rect x="206" y="134" width="16" height="46" rx="7" fill="{shade('Hamstrings')}"/>
-        <!-- calves -->
-        <rect x="190" y="184" width="12" height="42" rx="6" fill="{shade('Calves')}"/>
-        <rect x="208" y="184" width="12" height="42" rx="6" fill="{shade('Calves')}"/>
-      </svg>
-      <div style="display:flex;flex-direction:column;gap:5px;min-width:170px;padding-top:16px;">
-        {legend}
-      </div>
-    </div>
-    """
-    components.html(html, height=320)
+            <!-- ============ BACK ============ -->
+            <text x="205" y="12" font-size="9" fill="#9aa5b1" text-anchor="middle">BACK</text>
+            <circle cx="205" cy="34" r="13" fill="rgba(147,163,184,0.22)"/>
+            <rect x="195" y="48" width="20" height="8" rx="3" fill="rgba(147,163,184,0.22)"/>
+            <circle cx="183" cy="64" r="11" fill="{shade('Shoulders')}"/>
+            <circle cx="227" cy="64" r="11" fill="{shade('Shoulders')}"/>
+            <rect x="186" y="58" width="38" height="46" rx="7" fill="{shade('Back')}"/>
+            <rect x="169" y="74" width="13" height="34" rx="6" fill="{shade('Triceps')}"/>
+            <rect x="228" y="74" width="13" height="34" rx="6" fill="{shade('Triceps')}"/>
+            <rect x="188" y="108" width="34" height="20" rx="8" fill="{shade('Glutes')}"/>
+            <rect x="188" y="132" width="16" height="46" rx="7" fill="{shade('Hamstrings')}"/>
+            <rect x="206" y="132" width="16" height="46" rx="7" fill="{shade('Hamstrings')}"/>
+            <rect x="190" y="182" width="12" height="42" rx="6" fill="{shade('Calves')}"/>
+            <rect x="208" y="182" width="12" height="42" rx="6" fill="{shade('Calves')}"/>
+          </svg>
+        </div>
+        """
+        components.html(html, height=260)
+
+    with legend_col:
+        # Compact legend: swatch, muscle name, volume. Fixed region order so the
+        # rows don't jump around between visits.
+        rows = ""
+        for region in MUSCLE_REGIONS:
+            v = volume_by_region.get(region, 0)
+            rows += (
+                f"<div style='display:flex;align-items:center;gap:6px;"
+                f"padding:2px 0;font-size:0.75rem;'>"
+                f"<span style='width:11px;height:11px;border-radius:3px;flex:none;"
+                f"background:{shade(region)};display:inline-block;"
+                f"border:1px solid rgba(147,163,184,0.35);'></span>"
+                f"<span style='color:#9aa5b1;'>{region}</span>"
+                f"<span style='margin-left:auto;font-weight:600;color:#e6edf3;'>"
+                f"{v:,.0f} kg</span></div>"
+            )
+        st.markdown(f"<div style='padding-top:14px;'>{rows}</div>",
+                    unsafe_allow_html=True)
+
+    st.caption(t("volume_overlap_note"))
+
     return True
+
+
 # ---------------------------------------------------------------
 # UI
 # ---------------------------------------------------------------
@@ -2318,7 +2337,11 @@ if page == t("nav_home"):
     st.markdown(f"#### {t('muscle_volume_header')}")
     st.caption(t("muscle_volume_caption"))
     wk_start = today - timedelta(days=today.weekday())
-    if not render_muscle_heatmap(get_muscle_volume_for_range(wk_start, wk_start + timedelta(days=6))):
+    wk_end = wk_start + timedelta(days=6)
+    total_vol = get_total_volume_for_range(wk_start, wk_end)
+    if total_vol > 0:
+        st.metric(t("total_volume_label"), f"{total_vol:,.0f} kg")
+    if not render_muscle_heatmap(get_muscle_volume_for_range(wk_start, wk_end)):
         st.info(t("no_volume_yet"))
 
 elif page == t("nav_today"):
