@@ -618,6 +618,8 @@ BASE_EN = {
     "swap_search_placeholder": "e.g. dip, row, curl…",
     "swap_muscle_label": "Filter by muscle", "swap_all_muscles": "All muscles",
     "swap_matches_suffix": "matches — pick one below",
+    "swap_narrow_hint": "Too many to list. Type in the search box above to narrow it down.",
+    "swap_narrow_help": "Type in the search box above to shorten this list.",
     "swap_no_matches": "Nothing matched. Clear the filters, or just hit Swap to use "
                        "exactly what you typed.",
     "no_demo_for_swap": "No demo found for this name. Try picking from the list above.",
@@ -628,8 +630,24 @@ BASE_EN = {
     # --- sets / reps / weight logging ---
     "sets_header": "Sets", "set_label": "Set", "reps_label": "Reps",
     "weight_kg_label": "kg", "add_set": "➕ Add set", "remove_set": "➖ Remove last set",
-    "last_time_label": "Last time", "no_history_label": "No history yet for this lift",
+    "last_time_label": "Last time", "best_ever_label": "Best ever",
+    "last_peak_label": "Last session peak",
+    "new_pb_label": "New personal best —", "no_history_label": "No history yet for this lift",
     "session_volume_label": "Session volume", "e1rm_label": "Est. 1RM",
+    "calories_burned_label": "Est. kcal", "session_time_label": "Est. session time",
+    "calorie_per_exercise_help": "Rough MET-based estimate over ~{mins} min of work and rest. "
+                                 "Expect roughly ±30% accuracy.",
+    "day_total_calories_label": "Whole session — est. calories",
+    "calorie_detail_header": "🔥 Calorie estimate — how it's worked out",
+    "calorie_method_note": "Based on MET values from the 2024 Adult Compendium of Physical "
+                           "Activities, using a bodyweight of {bw} kg. Lifting is scored between "
+                           "3.5 METs (moderate) and 6.0 METs (vigorous) depending on how heavy "
+                           "the average rep was; walks and cardio use their logged time.",
+    "calorie_accuracy_warning": "Treat this as a rough guide, not a measurement. Real energy "
+                                "cost varies a lot with rest length, effort, fitness and body "
+                                "composition — a realistic error range is roughly ±30%. Useful "
+                                "for spotting trends between your own sessions; not accurate "
+                                "enough to plan a calorie deficit around.",
     "exercise_note_label": "Note for this exercise",
     "log_type_label": "How do you log this?",
     "per_side_label": "Weight is per hand (dumbbells)",
@@ -652,7 +670,15 @@ BASE_EN = {
     "rest_week_on": "🌙 Deload week — adherence stats won't count against you.",
     # --- PRs & analytics ---
     "lift_prs_header": "🏋️ Lift Records", "strength_trend_header": "📈 Strength Trend",
-    "pick_lift_label": "Pick a lift", "muscle_volume_header": "💪 Weekly Muscle Volume",
+    "pick_lift_label": "Pick a lift",
+    "sessions_logged_label": "Sessions", "e1rm_now_label": "Current est. 1RM",
+    "e1rm_peak_label": "Best ever", "heaviest_set_label": "Heaviest set",
+    "logged_on_label": "Logged on",
+    "trend_one_session": "Only one session logged for this lift so far — train it again "
+                         "and a trend line will appear here.",
+    "trend_no_data": "No weighted sets recorded for this lift yet.",
+    "no_weighted_sets": "No weighted sets logged yet. Add weight and reps on the Today "
+                        "page and your lifts will show up here.", "muscle_volume_header": "💪 Weekly Muscle Volume",
     "muscle_volume_caption": "Total kg lifted per muscle region this week",
     "total_volume_label": "Total lifted this week",
     "volume_overlap_note": "Muscle figures overlap — a bench press counts toward chest, shoulders and triceps, so they add up to more than the total.",
@@ -1211,6 +1237,39 @@ def set_exercise_swap(log_date, original_exercise, replacement_exercise):
            replacement_exercise=excluded.replacement_exercise""",
         (log_date, original_exercise, replacement_exercise))
 
+def get_all_swaps(log_date):
+    """{original_exercise: replacement_exercise} for one date."""
+    cols, rows = fetch("""SELECT original_exercise, replacement_exercise
+                          FROM exercise_swaps WHERE log_date=%s""", (log_date,))
+    return dict(rows)
+
+
+def effective_exercises_for_day(log_date, planned_exercises):
+    """Every exercise actually trained on a date, under the name its data is
+    stored against.
+
+    Sets are saved under the SWAPPED name, so anything reading set data has to
+    resolve swaps first — otherwise a swapped exercise silently contributes
+    nothing to volume or calorie totals.
+    """
+    swaps = get_all_swaps(log_date)
+    names = []
+    for ex in planned_exercises:
+        name = swaps.get(ex, ex)
+        if name not in names:
+            names.append(name)
+    # Extras: anything with a check or logged sets that isn't already covered
+    for extra in get_all_logged_exercises(log_date):
+        if extra not in names and extra not in planned_exercises:
+            names.append(extra)
+    cols, rows = fetch("SELECT DISTINCT exercise FROM exercise_sets WHERE log_date=%s",
+                       (log_date,))
+    for (name,) in rows:
+        if name not in names:
+            names.append(name)
+    return names
+
+
 def remove_exercise_swap(log_date, original_exercise):
     run("DELETE FROM exercise_swaps WHERE log_date=%s AND original_exercise=%s",
         (log_date, original_exercise))
@@ -1271,6 +1330,31 @@ def delete_photo(photo_id):
 # ---------------------------------------------------------------
 # WORKOUT PLAN (editable in-app, seeded from GYM_SPLIT defaults)
 # ---------------------------------------------------------------
+def repair_set_numbering():
+    """One-off cleanup for data written by an earlier buggy version.
+
+    That version could create a first set numbered 2 (and then keep overwriting
+    it), leaving gaps like [2] or [2,3]. This renumbers every affected exercise
+    to a clean 1..n, preserving order and values. Safe to run repeatedly.
+    """
+    if get_setting("set_numbering_repaired") == "1":
+        return
+    cols, rows = fetch("""SELECT log_date, exercise FROM exercise_sets
+                          GROUP BY log_date, exercise
+                          HAVING MIN(set_number) > 1
+                              OR MAX(set_number) <> COUNT(*)""")
+    for log_date, exercise in rows:
+        _, ordered = fetch("""SELECT set_number FROM exercise_sets
+                              WHERE log_date=%s AND exercise=%s
+                              ORDER BY set_number""", (log_date, exercise))
+        for new_num, (old_num,) in enumerate([r for r in ordered], start=1):
+            if old_num != new_num:
+                run("""UPDATE exercise_sets SET set_number=%s
+                       WHERE log_date=%s AND exercise=%s AND set_number=%s""",
+                    (new_num, log_date, exercise, old_num))
+    set_setting("set_numbering_repaired", "1")
+
+
 def seed_plan_if_empty():
     """First run: copy the hardcoded GYM_SPLIT defaults into the DB."""
     _, rows = fetch("SELECT COUNT(*) FROM workout_plan")
@@ -1371,11 +1455,84 @@ def effective_load(weight_kg, per_side):
     return float(weight_kg or 0) * (2 if per_side else 1)
 
 
+def next_set_number(log_date, exercise):
+    """Next free set number, derived from what's actually in the DB.
+
+    Must not be based on how many rows the UI is displaying: when an exercise
+    has no saved sets the UI shows an unsaved placeholder, so counting rows
+    would skip set 1 and then repeatedly overwrite set 2.
+    """
+    cols, rows = fetch("""SELECT COALESCE(MAX(set_number), 0) FROM exercise_sets
+                          WHERE log_date=%s AND exercise=%s""", (log_date, exercise))
+    return (rows[0][0] if rows else 0) + 1
+
+
+def renumber_sets(log_date, exercise):
+    """Close any gaps so sets read 1, 2, 3... after a delete."""
+    existing = get_sets(log_date, exercise)
+    for i, entry in enumerate(existing, start=1):
+        if entry["set_number"] != i:
+            run("""UPDATE exercise_sets SET set_number=%s
+                   WHERE log_date=%s AND exercise=%s AND set_number=%s""",
+                (i, log_date, exercise, entry["set_number"]))
+
+
 def delete_last_set(log_date, exercise):
     run("""DELETE FROM exercise_sets WHERE log_date=%s AND exercise=%s
            AND set_number = (SELECT MAX(set_number) FROM exercise_sets
                              WHERE log_date=%s AND exercise=%s)""",
         (log_date, exercise, log_date, exercise))
+
+
+def get_last_session_peak(exercise, before_date):
+    """Heaviest set from the most recent previous session of this exercise.
+
+    Distinct from get_best_ever: this is "what did I hit LAST time", which is
+    the number you're usually trying to match or beat today.
+    """
+    prev_date, prev_sets = get_last_session(exercise, before_date)
+    if not prev_sets:
+        return None
+    per_side = get_exercise_pref(exercise)["per_side"]
+    top = None
+    for x in prev_sets:
+        load = effective_load(x["weight_kg"], per_side)
+        reps = int(x["reps"] or 0)
+        if reps <= 0 or load <= 0:
+            continue
+        if top is None or load > top["weight_kg"]:
+            top = {"weight_kg": load, "reps": reps,
+                   "e1rm": estimated_1rm(load, reps), "log_date": prev_date}
+    return top
+
+
+def get_best_ever(exercise, before_date=None):
+    """Heaviest set and best estimated 1RM ever logged for this exercise.
+
+    Returns None if nothing's been logged. `before_date` excludes today so you
+    can show "beat this" rather than comparing against the set you just typed.
+    """
+    if before_date:
+        cols, rows = fetch("""SELECT reps, weight_kg, log_date FROM exercise_sets
+                              WHERE exercise=%s AND weight_kg > 0 AND reps > 0
+                              AND log_date < %s""", (exercise, before_date))
+    else:
+        cols, rows = fetch("""SELECT reps, weight_kg, log_date FROM exercise_sets
+                              WHERE exercise=%s AND weight_kg > 0 AND reps > 0""", (exercise,))
+    if not rows:
+        return None
+    per_side = get_exercise_pref(exercise)["per_side"]
+    best = None
+    top_weight = 0.0
+    for reps, weight, log_date in rows:
+        load = effective_load(weight, per_side)
+        e1rm = estimated_1rm(load, reps)
+        top_weight = max(top_weight, load)
+        if best is None or e1rm > best["e1rm"]:
+            best = {"weight_kg": load, "reps": int(reps), "e1rm": e1rm, "log_date": log_date}
+    if best:
+        best["top_weight"] = top_weight
+    return best
 
 
 def get_last_session(exercise, before_date):
@@ -1809,6 +1966,113 @@ def get_daily_quote():
 # ---------------------------------------------------------------
 # STRENGTH: PRs, estimated 1RM trend, muscle volume
 # ---------------------------------------------------------------
+# ---------------------------------------------------------------
+# CALORIE ESTIMATION
+# ---------------------------------------------------------------
+# Method: MET-based, per the 2024 Adult Compendium of Physical Activities.
+# 1 MET = roughly 1 kcal per kg of bodyweight per hour, so:
+#     kcal = MET x bodyweight_kg x hours
+#
+# Compendium reference values for resistance training:
+#   light/moderate effort  ~3.5 METs
+#   vigorous effort        ~6.0 METs
+#   circuit style, minimal rest ~8.0 METs
+#
+# Mechanical work (weight x reps x bar path) is deliberately NOT used as the
+# primary figure. An 80kg x 8 set is only ~0.75 kcal of external work, and even
+# allowing for ~25% muscular efficiency it's a few kcal — nowhere near what you
+# actually burn. Most of the cost is cardiovascular and comes from time spent
+# training, which is what METs capture. Work IS used to nudge the MET value up
+# or down, so a heavy session scores higher than an easy one of equal length.
+
+MET_RESISTANCE_LIGHT = 3.5
+MET_RESISTANCE_VIGOROUS = 6.0
+MET_WALKING_MODERATE = 3.5
+MET_WALKING_INCLINE = 6.0
+MET_RUNNING = 9.0
+
+# Assumed seconds per rep and rest between sets, used to turn a set count into
+# a session duration when you haven't logged actual time.
+SECONDS_PER_REP = 3.0
+SECONDS_REST_BETWEEN_SETS = 90.0
+
+
+def _bodyweight_kg(default=75.0):
+    """Latest logged bodyweight, falling back to the profile, then a default."""
+    cols, rows = fetch("""SELECT weight_kg FROM daily_log
+                          WHERE weight_kg IS NOT NULL AND weight_kg > 0
+                          ORDER BY log_date DESC LIMIT 1""")
+    if rows and rows[0][0]:
+        return float(rows[0][0])
+    profile = get_profile()
+    if profile.get("weight_kg"):
+        return float(profile["weight_kg"])
+    return default
+
+
+def estimate_exercise_calories(log_date, exercise, bodyweight_kg=None):
+    """Rough kcal for one exercise on one day.
+
+    Returns (kcal, minutes). Time-based entries use their logged duration with a
+    walking/running MET; lifting estimates duration from reps and set count, then
+    picks a MET between light and vigorous based on average load per rep.
+    """
+    if bodyweight_kg is None:
+        bodyweight_kg = _bodyweight_kg()
+
+    sets = get_sets(log_date, exercise)
+    if not sets:
+        return 0.0, 0.0
+
+    # ---- time-based (walks, cardio) ----
+    logged_minutes = sum(float(x.get("duration_min") or 0) for x in sets)
+    if logged_minutes > 0:
+        name = exercise.lower()
+        if "run" in name or "sprint" in name:
+            met = MET_RUNNING
+        elif "incline" in name or "hill" in name:
+            met = MET_WALKING_INCLINE
+        else:
+            met = MET_WALKING_MODERATE
+        return met * bodyweight_kg * (logged_minutes / 60.0), logged_minutes
+
+    # ---- lifting ----
+    per_side = get_exercise_pref(exercise)["per_side"]
+    total_reps = sum(int(x["reps"] or 0) for x in sets)
+    working_sets = sum(1 for x in sets if (x["reps"] or 0) > 0)
+    if total_reps == 0:
+        return 0.0, 0.0
+
+    minutes = (total_reps * SECONDS_PER_REP
+               + max(working_sets - 1, 0) * SECONDS_REST_BETWEEN_SETS) / 60.0
+
+    # Intensity: average load per rep relative to bodyweight. Ratio >= 1.0
+    # (lifting your own bodyweight or more per rep) counts as vigorous.
+    volume = sum(effective_load(x["weight_kg"], per_side) * int(x["reps"] or 0) for x in sets)
+    avg_load = volume / total_reps if total_reps else 0
+    ratio = min(avg_load / bodyweight_kg, 1.0) if bodyweight_kg else 0
+    met = MET_RESISTANCE_LIGHT + (MET_RESISTANCE_VIGOROUS - MET_RESISTANCE_LIGHT) * ratio
+
+    return met * bodyweight_kg * (minutes / 60.0), minutes
+
+
+def estimate_day_calories(log_date, exercises):
+    """Total estimated kcal and minutes across a day's exercises."""
+    bw = _bodyweight_kg()
+    total_kcal = 0.0
+    total_min = 0.0
+    breakdown = []
+    for ex in exercises:
+        kcal, mins = estimate_exercise_calories(log_date, ex, bw)
+        if kcal > 0:
+            breakdown.append({"exercise": ex, "kcal": kcal, "minutes": mins})
+            total_kcal += kcal
+            total_min += mins
+    return {"kcal": total_kcal, "minutes": total_min,
+            "breakdown": sorted(breakdown, key=lambda r: r["kcal"], reverse=True),
+            "bodyweight_kg": bw}
+
+
 def get_lift_prs(limit=12):
     """Heaviest single set per exercise, plus the best estimated 1RM.
 
@@ -2668,6 +2932,7 @@ with st.sidebar:
 # PLAN is the editable workout split, loaded from the DB (seeded from GYM_SPLIT
 # on first run). Everything downstream reads PLAN, never GYM_SPLIT directly, so
 # edits made on the Workout Plan page take effect everywhere.
+repair_set_numbering()   # one-off cleanup of sets numbered from 2 by an older build
 PLAN = load_plan()
 TARGETS = load_targets()
 st.title(t("app_title"))
@@ -2784,6 +3049,9 @@ elif page == t("nav_today"):
         with head_col:
             st.markdown(f"### {day_plan['label']}")
             st.caption(f"{done_ex}/{total_ex} exercises done")
+            # Resolve swaps: a swapped exercise's sets live under the NEW name.
+            all_today_ex = effective_exercises_for_day(log_date_str, day_plan["exercises"])
+
             with st.expander(t("rest_timer_label"), expanded=False):
                 rt1, rt2, rt3 = st.columns(3)
                 for secs, col in ((60, rt1), (90, rt2), (180, rt3)):
@@ -2816,6 +3084,23 @@ elif page == t("nav_today"):
                     prev_sets, per_side=get_exercise_pref(effective_name)["per_side"])
                 if summary:
                     st.caption(f"↩ {t('last_time_label')} ({prev_date}): {summary}")
+
+            # Peak from the last session, and best ever — the two numbers you're
+            # aiming at. Both exclude today so they don't mirror what you just typed.
+            last_peak = get_last_session_peak(effective_name, log_date_str)
+            pb = get_best_ever(effective_name, before_date=log_date_str)
+            peak_bits = []
+            if last_peak:
+                peak_bits.append(
+                    f"⬆ {t('last_peak_label')}: **{last_peak['weight_kg']:g} kg** "
+                    f"× {last_peak['reps']}")
+            if pb:
+                peak_bits.append(f"🏅 {t('best_ever_label')}: **{pb['top_weight']:g} kg**")
+            if peak_bits:
+                st.markdown(
+                    f"<div style='font-size:0.82rem;color:#9aa5b1;margin:-6px 0 6px 0;'>"
+                    + "&nbsp;&nbsp;·&nbsp;&nbsp;".join(peak_bits).replace("**", "")
+                    + "</div>", unsafe_allow_html=True)
 
             with st.expander(f"{t('exercise_info_label')} — {effective_name}", expanded=False):
                 info = find_exercise_info(effective_name)
@@ -2909,31 +3194,59 @@ elif page == t("nav_today"):
                 with ac1:
                     if st.button(t("add_set"), key=f"addset_{log_date_str}_{effective_name}",
                                  use_container_width=True):
-                        save_set(log_date_str, effective_name, len(sets) + 1, 0, 0)
+                        # If the only row on screen is the unsaved placeholder,
+                        # persist it first so the new set lands at 2, not 1.
+                        stored = get_sets(log_date_str, effective_name)
+                        if not stored:
+                            first = sets[0]
+                            save_set(log_date_str, effective_name, 1,
+                                     first.get("reps", 0), first.get("weight_kg", 0),
+                                     first.get("duration_min", 0), first.get("distance_km", 0))
+                        save_set(log_date_str, effective_name,
+                                 next_set_number(log_date_str, effective_name), 0, 0)
                         st.rerun()
                 with ac2:
                     if len(sets) > 1 and st.button(
                             t("remove_set"), key=f"delset_{log_date_str}_{effective_name}",
                             use_container_width=True):
                         delete_last_set(log_date_str, effective_name)
+                        renumber_sets(log_date_str, effective_name)
                         st.rerun()
 
                 # ---------------- SESSION SUMMARY ----------------
                 if chosen_type == "duration":
                     mins, km = get_session_duration(log_date_str, effective_name)
                     if mins or km:
-                        d1, d2 = st.columns(2)
+                        ex_kcal, _ = estimate_exercise_calories(log_date_str, effective_name)
+                        d1, d2, d3 = st.columns(3)
                         d1.metric(t("total_time_label"), f"{mins:g} min")
                         d2.metric(t("total_distance_label"), f"{km:g} km")
+                        d3.metric(t("calories_burned_label"), f"~{ex_kcal:,.0f}")
                 else:
                     vol = get_session_volume(log_date_str, effective_name)
                     if vol > 0:
+                        today_sets = get_sets(log_date_str, effective_name)
                         best = max((estimated_1rm(effective_load(x["weight_kg"], per_side), x["reps"])
-                                    for x in get_sets(log_date_str, effective_name)), default=0)
-                        v1, v2 = st.columns(2)
+                                    for x in today_sets), default=0)
+                        today_top = max((effective_load(x["weight_kg"], per_side)
+                                         for x in today_sets), default=0)
+                        prior = get_best_ever(effective_name, before_date=log_date_str)
+
+                        ex_kcal, ex_min = estimate_exercise_calories(
+                            log_date_str, effective_name)
+                        v1, v2, v3 = st.columns(3)
                         v1.metric(t("session_volume_label"), f"{vol:,.0f} kg")
                         if best > 0:
-                            v2.metric(t("e1rm_label"), f"{best:.1f} kg")
+                            delta = f"{best - prior['e1rm']:+.1f} kg" if prior else None
+                            v2.metric(t("e1rm_label"), f"{best:.1f} kg", delta=delta)
+                        v3.metric(t("calories_burned_label"), f"~{ex_kcal:,.0f}",
+                                  help=t("calorie_per_exercise_help").format(
+                                      mins=f"{ex_min:.0f}"))
+
+                        if prior and today_top > prior["top_weight"]:
+                            st.success(
+                                f"🎉 {t('new_pb_label')} {today_top:g} kg "
+                                f"(was {prior['top_weight']:g} kg)")
 
                 note = st.text_input(
                     t("exercise_note_label"), value=get_exercise_note(log_date_str, effective_name),
@@ -2954,31 +3267,41 @@ elif page == t("nav_today"):
                 # Picking from the known list means the swapped exercise still
                 # gets its demo images, muscles and cues. Free text still works,
                 # and is matched fuzzily against the library.
-                # Search + muscle filter narrow the dropdown, so you don't have
-                # to scroll a 370-item list on a phone.
-                f1, f2 = st.columns([3, 2])
-                with f1:
-                    swap_query = st.text_input(
-                        t("swap_search_label"), value="",
-                        placeholder=t("swap_search_placeholder"),
-                        key=f"swap_q_{log_date_str}_{ex}")
-                with f2:
-                    muscle_opts = [t("swap_all_muscles")] + exercise_muscle_filters()
-                    swap_muscle = st.selectbox(
-                        t("swap_muscle_label"), muscle_opts, index=0,
-                        key=f"swap_m_{log_date_str}_{ex}")
+                # Filters are stacked, not in columns. Side-by-side columns get
+                # squeezed to ~40% width on a phone, which made the muscle
+                # dropdown nearly unusable.
+                muscle_opts = [t("swap_all_muscles")] + exercise_muscle_filters()
+                swap_muscle = st.selectbox(
+                    t("swap_muscle_label"), muscle_opts, index=0,
+                    key=f"swap_m_{log_date_str}_{ex}")
+
+                swap_query = st.text_input(
+                    t("swap_search_label"), value="",
+                    placeholder=t("swap_search_placeholder"),
+                    key=f"swap_q_{log_date_str}_{ex}")
 
                 muscle_filter = None if swap_muscle == t("swap_all_muscles") else swap_muscle
                 matches = search_exercises(swap_query, muscle_filter)
 
-                if not matches:
-                    st.caption(t("swap_no_matches"))
-                    picked_swap = None
+                picked_swap = None
+                if matches:
+                    st.caption(f"**{len(matches)}** {t('swap_matches_suffix')}")
+                    # A radio list for short result sets: no dropdown to open, no
+                    # scrolling inside a tiny native picker on mobile.
+                    if len(matches) <= 12:
+                        picked_swap = st.radio(
+                            t("swap_label"), matches, index=0,
+                            label_visibility="collapsed",
+                            key=f"swap_radio_{log_date_str}_{ex}")
+                    else:
+                        picked_swap = st.selectbox(
+                            t("swap_label"), matches, index=0,
+                            label_visibility="collapsed",
+                            help=t("swap_narrow_help"),
+                            key=f"swap_pick_{log_date_str}_{ex}")
+                        st.caption(t("swap_narrow_hint"))
                 else:
-                    st.caption(f"{len(matches)} {t('swap_matches_suffix')}")
-                    picked_swap = st.selectbox(
-                        t("swap_label"), matches, index=0, label_visibility="collapsed",
-                        key=f"swap_pick_{log_date_str}_{ex}")
+                    st.caption(t("swap_no_matches"))
 
                 if st.button(t("swap_confirm"), key=f"swap_btn_{log_date_str}_{ex}",
                              type="primary", use_container_width=True):
@@ -3021,6 +3344,24 @@ elif page == t("nav_today"):
                 if new_extra_name.strip():
                     set_exercise_check(log_date_str, new_extra_name.strip(), True)
                     st.rerun()
+
+        # ---- Estimated energy cost of this session ----
+        burn = estimate_day_calories(log_date_str, all_today_ex)
+        if burn["kcal"] > 0:
+            st.markdown("---")
+            bt1, bt2 = st.columns(2)
+            bt1.metric(t("day_total_calories_label"), f"~{burn['kcal']:,.0f} kcal")
+            bt2.metric(t("session_time_label"), f"~{burn['minutes']:.0f} min")
+            with st.expander(t("calorie_detail_header"), expanded=False):
+                st.caption(t("calorie_method_note").format(bw=f"{burn['bodyweight_kg']:.0f}"))
+                rows_df = pd.DataFrame([{
+                    "Exercise": b["exercise"],
+                    "Minutes": f"{b['minutes']:.0f}",
+                    "kcal": f"{b['kcal']:,.0f}",
+                } for b in burn["breakdown"]])
+                st.dataframe(rows_df, hide_index=True, use_container_width=True)
+                st.metric(t("calories_burned_label"), f"~{burn['kcal']:,.0f} kcal")
+                st.warning(t("calorie_accuracy_warning"))
 
     # ============================ MEALS ============================
     with tab_meals:
@@ -3424,20 +3765,43 @@ elif page == t("nav_achievements"):
 
     st.markdown(f"#### {t('strength_trend_header')}")
     lifts = get_logged_exercise_names()
-    if lifts:
+    if not lifts:
+        st.info(t("no_weighted_sets"))
+    else:
         chosen = st.selectbox(t("pick_lift_label"), lifts, key="strength_pick")
         trend = get_strength_trend(chosen)
+
         if len(trend) >= 2:
             fig_s = px.line(trend, x="log_date", y="e1rm", markers=True,
                             title=f"Estimated 1RM — {chosen}")
             fig_s.update_layout(yaxis_title="Est. 1RM (kg)", xaxis_title="")
             st.plotly_chart(fig_s, use_container_width=True)
+
             first, last = trend["e1rm"].iloc[0], trend["e1rm"].iloc[-1]
-            st.caption(f"Change since first session: {last - first:+.1f} kg")
+            peak = trend["e1rm"].max()
+            m1, m2, m3 = st.columns(3)
+            m1.metric(t("sessions_logged_label"), len(trend))
+            m2.metric(t("e1rm_now_label"), f"{last:.1f} kg", delta=f"{last - first:+.1f} kg")
+            m3.metric(t("e1rm_peak_label"), f"{peak:.1f} kg")
+
+            show = trend.copy()
+            show["log_date"] = show["log_date"].dt.strftime("%d %b %Y")
+            st.dataframe(
+                show.rename(columns={"log_date": "Date", "e1rm": "Est. 1RM (kg)",
+                                     "top_weight": "Heaviest set (kg)"}),
+                hide_index=True, use_container_width=True)
+
+        elif len(trend) == 1:
+            # One session is still worth showing — previously this branch printed
+            # a small caption and looked like the picker had done nothing.
+            only = trend.iloc[0]
+            st.info(t("trend_one_session"))
+            o1, o2 = st.columns(2)
+            o1.metric(t("e1rm_label"), f"{only['e1rm']:.1f} kg")
+            o2.metric(t("heaviest_set_label"), f"{only['top_weight']:g} kg")
+            st.caption(f"{t('logged_on_label')} {only['log_date'].strftime('%d %b %Y')}")
         else:
-            st.caption("Log this lift on at least two separate days to see a trend.")
-    else:
-        st.caption("No weighted sets logged yet.")
+            st.info(t("trend_no_data"))
 
 elif page == t("nav_plan"):
     st.subheader(t("plan_header"))
