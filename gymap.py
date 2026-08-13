@@ -9,9 +9,10 @@ import plotly.express as px
 import base64
 from datetime import date, timedelta
 
-# NOTE: we no longer use the google-generativeai SDK. Gym Bro now calls the
-# Gemini REST endpoint directly with `requests` (see ask_gym_bro below), which
-# avoids the SDK's OAuth/ADC fallback that caused the 401 error.
+# NOTE: Gym Bro talks to the Gemini REST endpoint directly with `requests` — no
+# Google SDK. It uses function calling: the tools declared in GYM_BRO_TOOLS let
+# the model request the user's own logged data, which this app then queries and
+# hands back. Every tool is read-only; there is no write path and no raw SQL.
 
 # ---------------------------------------------------------------
 # CONFIG
@@ -2205,24 +2206,51 @@ def format_set_summary(sets, per_side=False):
 # ---------------------------------------------------------------
 # GYM BRO (AI chatbot — free Gemini API)
 # ---------------------------------------------------------------
+# `gemini-flash-latest` is an alias that always resolves to the current stable
+# flash model. Pinning an exact version (e.g. gemini-2.5-flash) means the app
+# breaks with a 404 the day Google retires it — which is what happened before.
+GEMINI_MODEL = "gemini-flash-latest"
+
 GYM_BRO_SYSTEM_PROMPT = """You are "Gym Bro" — a friendly, knowledgeable fitness buddy inside the Momentum app.
 
-Scope: only answer questions about training, exercise technique, nutrition, recovery, sleep, hydration,
-supplements (general info, not dosing prescriptions), and general healthy habits. If asked about something
-unrelated, politely redirect back to fitness/health topics.
+You can look up the user's own logged data using the tools provided. Use them whenever a
+question refers to their training, food, weight, steps or measurements — don't guess, and
+don't answer from memory of earlier turns if a fresh lookup would be more accurate.
+
+Scope: only answer questions about training, exercise technique, nutrition, recovery, sleep,
+hydration, supplements (general info, not dosing prescriptions), and general healthy habits.
+If asked about something unrelated, politely redirect back to fitness/health topics.
 
 Rules you always follow:
 - You are not a doctor. Never diagnose, never give specific dosing/medical treatment advice.
-- If someone describes an injury, sharp pain, chest pain, dizziness, or anything that sounds medically
-  concerning, tell them clearly to see a doctor or medical professional rather than trying to solve it yourself.
-- Keep answers practical, encouraging, and concise — a few short paragraphs or a bullet list, not an essay.
-- Use the person's profile/target context below if relevant, but don't force it into every answer.
-- Never claim certainty about individualized medical outcomes.
+- If someone describes an injury, sharp pain, chest pain, dizziness, or anything that sounds
+  medically concerning, tell them clearly to see a doctor or medical professional rather than
+  trying to solve it yourself.
+- Do NOT prescribe a specific daily calorie deficit, a goal weight, or a rate of weight loss.
+  You can explain general principles and refer to the targets the user has already set in the
+  app, but the numbers are theirs to choose.
+- The tools are the ONLY source of truth about this user. If a tool returns nothing for a
+  date or exercise, say so plainly — never invent numbers, and never estimate a figure that
+  looks like it came from their log.
+- Calorie burn figures in this app are rough MET-based estimates (roughly ±30%). Treat them
+  as trend indicators, not measurements, and say so if you quote one.
+- Keep answers practical, encouraging, and concise — a few short paragraphs or a bullet list,
+  not an essay.
 """
+
+# How many times Gemini may call tools before we stop and answer with what we have.
+# A normal question needs 1 round; a comparison might need 2-3. The cap exists so a
+# confused model can't loop forever burning quota.
+MAX_TOOL_ROUNDS = 5
+
 
 def get_gemini_api_key():
     """Reads the Gemini API key from secrets.toml. Supports both
-    [gemini] api_key = "..."  and a bare  gemini_api_key = "..."  entry."""
+    [gemini] api_key = "..."  and a bare  gemini_api_key = "..."  entry.
+
+    Note: TOML scopes keys to the [section] above them. An `api_key` line sitting
+    under [connections.postgres] is NOT found here — it needs its own [gemini] header.
+    """
     try:
         if "gemini" in st.secrets and "api_key" in st.secrets["gemini"]:
             return str(st.secrets["gemini"]["api_key"]).strip()
@@ -2233,144 +2261,442 @@ def get_gemini_api_key():
     return None
 
 
-def _gym_bro_via_sdk(system_prompt, contents_plain, api_key):
-    """Attempt the call through Google's official google-genai SDK.
+# ---------------------------------------------------------------
+# GYM BRO TOOLS — read-only lookups over the user's own data
+# ---------------------------------------------------------------
+# Gemini can call these by name. Everything here is SELECT-only: there is no tool
+# that writes, updates or deletes, and no tool that takes raw SQL. The model can
+# only reach the specific queries defined below, with the arguments declared.
 
-    Returns (text, None) on success, or (None, error_string) on failure.
-    Returns (None, "SDK_MISSING") if the library isn't installed.
+def _json_safe(obj):
+    """Make DB/pandas values JSON-serialisable.
 
-    Worth trying before raw REST: the official SDK handles credential plumbing
-    internally, and during Google's AIza -> AQ. key migration some accounts see
-    raw REST calls rejected with ACCESS_TOKEN_TYPE_UNSUPPORTED while the SDK
-    path still works.
+    psycopg2 hands back Decimal, pandas hands back numpy scalars and NaT, and
+    json.dumps chokes on all of them. Also converts NaN to None so the model sees
+    a clear 'no value' rather than a float it might quote back as a number.
     """
-    try:
-        from google import genai
-        from google.genai import types
-    except ImportError:
-        return None, "SDK_MISSING"
+    import math
+    from decimal import Decimal
 
-    try:
-        client = genai.Client(api_key=api_key)
-        contents = [
-            types.Content(role=role, parts=[types.Part.from_text(text=text)])
-            for role, text in contents_plain
-        ]
-        resp = client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=contents,
-            config=types.GenerateContentConfig(system_instruction=system_prompt),
-        )
-        text = (resp.text or "").strip()
-        return (text, None) if text else (None, "Empty reply from Gemini.")
-    except Exception as e:
-        return None, f"{type(e).__name__}: {e}"
+    if obj is None:
+        return None
+    if isinstance(obj, dict):
+        return {str(k): _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_json_safe(v) for v in obj]
+    if isinstance(obj, Decimal):
+        return float(obj)
+    if isinstance(obj, (date, )):
+        return obj.isoformat()
+    if isinstance(obj, bool):
+        return obj
+    if isinstance(obj, (int, str)):
+        return obj
+    if isinstance(obj, float):
+        return None if math.isnan(obj) or math.isinf(obj) else round(obj, 3)
+    # numpy / pandas scalars
+    if hasattr(obj, "item"):
+        try:
+            return _json_safe(obj.item())
+        except Exception:
+            pass
+    if pd.isna(obj) if not hasattr(obj, "__len__") else False:
+        return None
+    return str(obj)
 
 
-def ask_gym_bro(user_message, chat_history, profile, targets):
-    """Sends the question to Gemini.
+def _resolve_dates(days=None, start_date=None, end_date=None, default_days=14):
+    """Turn the model's loose date arguments into a concrete (start, end) pair."""
+    today = date.today()
+    end = today
+    if end_date:
+        try:
+            end = date.fromisoformat(str(end_date)[:10])
+        except ValueError:
+            end = today
+    if start_date:
+        try:
+            return date.fromisoformat(str(start_date)[:10]), end
+        except ValueError:
+            pass
+    n = int(days) if days else default_days
+    n = max(1, min(n, 730))
+    return end - timedelta(days=n - 1), end
 
-    Tries the official google-genai SDK first, then falls back to a raw REST call
-    (query param, then x-goog-api-key header). Belt and braces, because Google's
-    ongoing AIza -> AQ. API key migration has left some accounts where one route
-    authenticates and another returns 401 ACCESS_TOKEN_TYPE_UNSUPPORTED.
 
-    We deliberately never validate the shape of the key — a key starting with
-    `AQ.` is the current correct format, and the format is Google's to change.
+def _match_exercise_name(name):
+    """Map whatever the model typed onto a name that actually has logged sets.
+
+    Returns (resolved_name, candidates). Falls back to the app's own fuzzy
+    exercise lookup so 'bench' finds 'Bench Press'.
     """
-    api_key = get_gemini_api_key()
-    if not api_key:
-        return None  # signals missing key to the caller
+    cols, rows = fetch("SELECT DISTINCT exercise FROM exercise_sets")
+    known = [r[0] for r in rows]
+    if not name:
+        return None, known
+    if name in known:
+        return name, known
+    norm = _normalise_exercise_name(name)
+    for k in known:
+        if _normalise_exercise_name(k) == norm:
+            return k, known
+    partial = [k for k in known if norm and norm in _normalise_exercise_name(k)]
+    if len(partial) == 1:
+        return partial[0], known
+    if partial:
+        return min(partial, key=len), known
+    return None, known
 
-    context = (
-        f"[User context - goal: {profile.get('goal')}, activity level: {profile.get('activity_level')}, "
-        f"protein target: {targets.get('protein_min')}-{targets.get('protein_max')}g, "
-        f"step target: {targets.get('steps_min')}-{targets.get('steps_max')}]"
-    )
-    final_question = f"{context}\n\nUser question: {user_message}"
 
-    # (role, text) pairs, shared by both the SDK and REST paths
-    contents_plain = [
-        ("user" if role == "user" else "model", text) for role, text in chat_history[-10:]
-    ]
-    contents_plain.append(("user", final_question))
+def _gb_daily_numbers(days=None, start_date=None, end_date=None):
+    """Steps, protein, water, weight and meal calories per day."""
+    start, end = _resolve_dates(days, start_date, end_date, default_days=14)
+    daily = get_range_df(start, end)
+    macros = get_meal_macro_totals_for_range(start, end)
+    if daily.empty:
+        return {"range": [start.isoformat(), end.isoformat()], "days": [],
+                "note": "No daily log entries in this range."}
+    merged = daily.merge(macros, on="log_date", how="left")
+    out = []
+    for _, r in merged.iterrows():
+        out.append({
+            "date": r["log_date"],
+            "steps": r.get("steps"),
+            "protein_g": r.get("protein_g"),
+            "water_l": r.get("water_l"),
+            "weight_kg": r.get("weight_kg"),
+            "meal_calories": r.get("calories_total"),
+        })
+    return {"range": [start.isoformat(), end.isoformat()], "days": out}
 
-    # --- Attempt 1: official SDK ---
-    sdk_text, sdk_err = _gym_bro_via_sdk(GYM_BRO_SYSTEM_PROMPT, contents_plain, api_key)
-    if sdk_text:
-        return sdk_text
 
-    # --- Attempt 2: raw REST ---
-    url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
-    payload = {
-        "systemInstruction": {"parts": [{"text": GYM_BRO_SYSTEM_PROMPT}]},
-        "contents": [
-            {"role": role, "parts": [{"text": text}]} for role, text in contents_plain
-        ],
+def _gb_workout_on(date_str=None):
+    """What was planned and what was actually logged on one date."""
+    try:
+        d = date.fromisoformat(str(date_str)[:10]) if date_str else date.today()
+    except ValueError:
+        d = date.today()
+    ds = d.isoformat()
+    weekday = WEEKDAY_NAMES[d.weekday()]
+    day_plan = PLAN.get(weekday, {"label": weekday, "exercises": []})
+    swaps = get_all_swaps(ds)
+    checks = get_all_logged_exercises(ds)
+
+    entries = []
+    for name in effective_exercises_for_day(ds, day_plan["exercises"]):
+        sets = get_sets(ds, name)
+        pref = get_exercise_pref(name)
+        entry = {
+            "exercise": name,
+            "completed": bool(checks.get(name, 0)),
+            "sets": [{"set": s["set_number"], "reps": s["reps"],
+                      "weight_kg": s["weight_kg"], "duration_min": s["duration_min"],
+                      "distance_km": s["distance_km"]} for s in sets],
+            "weight_is_per_hand": pref["per_side"],
+        }
+        note = get_exercise_note(ds, name)
+        if note:
+            entry["note"] = note
+        if sets:
+            entry["volume_kg"] = get_session_volume(ds, name)
+        entries.append(entry)
+
+    return {
+        "date": ds, "weekday": weekday, "day_label": day_plan["label"],
+        "planned_exercises": day_plan["exercises"],
+        "swaps": swaps or None,
+        "logged": entries,
+        "estimated_kcal_note": "Session calorie estimates are MET-based, roughly ±30%.",
     }
 
-    def _call(use_header):
-        if use_header:
-            return requests.post(
-                url, headers={"x-goog-api-key": api_key}, json=payload, timeout=45)
-        return requests.post(url, params={"key": api_key}, json=payload, timeout=45)
 
-    try:
-        resp = _call(use_header=False)
-        if resp.status_code in (401, 403):
-            resp = _call(use_header=True)
-    except Exception as e:
-        return f"⚠️ Couldn't reach Gemini: {e}"
+def _gb_exercise_history(exercise=None, days=None):
+    """Every session of one exercise, with the sets from each."""
+    resolved, known = _match_exercise_name(exercise)
+    if not resolved:
+        return {"error": f"No logged sets found for '{exercise}'.",
+                "exercises_with_data": sorted(known)[:60]}
+    start, end = _resolve_dates(days, default_days=180)
+    cols, rows = fetch("""SELECT log_date, set_number, reps, weight_kg,
+                                 COALESCE(duration_min,0), COALESCE(distance_km,0)
+                          FROM exercise_sets
+                          WHERE exercise=%s AND log_date BETWEEN %s AND %s
+                          ORDER BY log_date, set_number""",
+                       (resolved, start.isoformat(), end.isoformat()))
+    per_side = get_exercise_pref(resolved)["per_side"]
+    sessions = {}
+    for log_date, n, reps, weight, dur, dist in rows:
+        sessions.setdefault(log_date, []).append(
+            {"set": n, "reps": reps, "weight_kg": weight,
+             "duration_min": dur, "distance_km": dist})
+    best = get_best_ever(resolved)
+    return {
+        "exercise": resolved,
+        "matched_from": exercise if resolved != exercise else None,
+        "weight_is_per_hand": per_side,
+        "sessions": [{"date": d, "sets": s} for d, s in sorted(sessions.items())],
+        "best_ever": best,
+    }
 
-    if resp.status_code == 200:
-        try:
-            parts = resp.json()["candidates"][0]["content"]["parts"]
-            text = "".join(p.get("text", "") for p in parts).strip()
-            if text:
-                return text
-            return "⚠️ Gemini returned an empty reply. Try rephrasing the question."
-        except Exception:
-            return f"⚠️ Couldn't parse Gemini's reply: {resp.text[:300]}"
 
+def _gb_lift_records():
+    """Best estimated 1RM per exercise, ranked."""
+    prs = get_lift_prs(limit=25)
+    if not prs:
+        return {"note": "No weighted sets logged yet."}
+    return {"records": prs,
+            "method": "Estimated 1RM uses the Epley formula — an estimate, not a tested max."}
+
+
+def _gb_muscle_volume(days=None):
+    """Training volume per muscle region."""
+    start, end = _resolve_dates(days, default_days=7)
+    by_region = get_muscle_volume_for_range(start, end)
+    total = get_total_volume_for_range(start, end)
+    if total <= 0:
+        return {"range": [start.isoformat(), end.isoformat()],
+                "note": "No weighted sets logged in this range."}
+    return {
+        "range": [start.isoformat(), end.isoformat()],
+        "total_kg_lifted": total,
+        "by_muscle_kg": {k: v for k, v in by_region.items() if v > 0},
+        "note": ("Muscle figures overlap — a bench press counts toward chest, shoulders "
+                 "and triceps — so they sum to more than the total."),
+    }
+
+
+def _gb_profile_and_targets():
+    """The user's profile and their current daily targets."""
+    return {"profile": get_profile(), "targets": load_targets(),
+            "today": date.today().isoformat()}
+
+
+def _gb_measurements(days=None):
+    """Body measurement history."""
+    df = get_all_measurements()
+    if df.empty:
+        return {"note": "No measurements logged yet."}
+    start, end = _resolve_dates(days, default_days=365)
+    df = df[(df["log_date"] >= start.isoformat()) & (df["log_date"] <= end.isoformat())]
+    if df.empty:
+        return {"note": "No measurements logged in this range."}
+    return {"measurements": df.to_dict("records")}
+
+
+def _gb_streaks_and_totals():
+    """Streak, days logged, and lifetime totals."""
+    streak, longest, total_days = compute_streak_stats()
+    stats = get_lifetime_stats(load_targets())
+    return {"current_streak_days": streak, "longest_streak_days": longest,
+            "days_logged": total_days, "lifetime": stats}
+
+
+GYM_BRO_TOOL_DISPATCH = {
+    "get_daily_numbers": _gb_daily_numbers,
+    "get_workout_on_date": _gb_workout_on,
+    "get_exercise_history": _gb_exercise_history,
+    "get_lift_records": _gb_lift_records,
+    "get_muscle_volume": _gb_muscle_volume,
+    "get_profile_and_targets": _gb_profile_and_targets,
+    "get_measurements": _gb_measurements,
+    "get_streaks_and_totals": _gb_streaks_and_totals,
+}
+
+_DAYS_PARAM = {"type": "INTEGER",
+               "description": "How many days back from today to include."}
+
+GYM_BRO_TOOLS = [{"functionDeclarations": [
+    {
+        "name": "get_daily_numbers",
+        "description": ("Daily steps, protein, water, bodyweight and meal calories over a "
+                        "date range. Use for questions about steps, hydration, protein "
+                        "intake, weight trend or calories eaten."),
+        "parameters": {"type": "OBJECT", "properties": {
+            "days": _DAYS_PARAM,
+            "start_date": {"type": "STRING", "description": "ISO date YYYY-MM-DD."},
+            "end_date": {"type": "STRING", "description": "ISO date YYYY-MM-DD."},
+        }},
+    },
+    {
+        "name": "get_workout_on_date",
+        "description": ("The planned session and everything actually logged on one date — "
+                        "exercises, sets, reps, weights, notes and swaps. Defaults to today."),
+        "parameters": {"type": "OBJECT", "properties": {
+            "date_str": {"type": "STRING", "description": "ISO date YYYY-MM-DD."},
+        }},
+    },
+    {
+        "name": "get_exercise_history",
+        "description": ("Every logged session of one exercise, with the sets from each, plus "
+                        "the best ever set. Use for 'how has my bench progressed' questions."),
+        "parameters": {"type": "OBJECT", "properties": {
+            "exercise": {"type": "STRING",
+                         "description": "Exercise name; partial names are matched."},
+            "days": _DAYS_PARAM,
+        }, "required": ["exercise"]},
+    },
+    {
+        "name": "get_lift_records",
+        "description": "Personal records across all lifts, ranked by estimated 1RM.",
+        "parameters": {"type": "OBJECT", "properties": {}},
+    },
+    {
+        "name": "get_muscle_volume",
+        "description": ("Training volume in kg per muscle region over a period. Use for "
+                        "'which muscles am I neglecting' questions."),
+        "parameters": {"type": "OBJECT", "properties": {"days": _DAYS_PARAM}},
+    },
+    {
+        "name": "get_profile_and_targets",
+        "description": ("The user's goal, activity level, height, age, and their current "
+                        "protein/water/steps/calorie targets. Also returns today's date."),
+        "parameters": {"type": "OBJECT", "properties": {}},
+    },
+    {
+        "name": "get_measurements",
+        "description": "Body measurement history — waist, chest, hips, arms, thighs.",
+        "parameters": {"type": "OBJECT", "properties": {"days": _DAYS_PARAM}},
+    },
+    {
+        "name": "get_streaks_and_totals",
+        "description": "Current streak, longest streak, days logged, and lifetime totals.",
+        "parameters": {"type": "OBJECT", "properties": {}},
+    },
+]}]
+
+
+def _gemini_call(contents, system_prompt, tools=None, timeout=60):
+    """One REST call to Gemini. Retries with the header auth route on 401/403."""
+    api_key = get_gemini_api_key()
+    url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
+           f"{GEMINI_MODEL}:generateContent")
+    payload = {
+        "systemInstruction": {"parts": [{"text": system_prompt}]},
+        "contents": contents,
+    }
+    if tools:
+        payload["tools"] = tools
+    resp = requests.post(url, params={"key": api_key}, json=payload, timeout=timeout)
     if resp.status_code in (401, 403):
-        sdk_note = ""
-        if sdk_err == "SDK_MISSING":
-            sdk_note = ("\n\n**The google-genai SDK isn't installed.** Try "
-                        "`pip install google-genai` — on some accounts the SDK path works "
-                        "where raw REST doesn't.")
-        elif sdk_err:
-            sdk_note = f"\n\nThe SDK route also failed: `{sdk_err[:180]}`"
+        resp = requests.post(url, headers={"x-goog-api-key": api_key},
+                             json=payload, timeout=timeout)
+    return resp
 
+
+def _gemini_error_message(resp):
+    """Human-readable explanation for a non-200 response."""
+    if resp.status_code in (401, 403):
         return (
-            "⚠️ Gemini rejected the key (401/403) on **every** route tried — SDK, "
-            "`?key=` query param, and `x-goog-api-key` header.\n\n"
-            "This is very likely **not your key and not this app.** Google is migrating "
-            "API keys from `AIza...` to `AQ....`, and a number of accounts are stuck where "
-            "every new `AQ.` key is refused by the Gemini API with exactly this "
-            "`ACCESS_TOKEN_TYPE_UNSUPPORTED` error. Regenerating the key or making a new "
-            "project does not fix it.\n\n"
-            "**What to do:** report it to Google with your project number so they can "
-            "unblock the account — see the compatibility form linked from "
-            "https://ai.google.dev/gemini-api/docs/api-key . Everything else in Momentum "
-            "works fine in the meantime."
-            + sdk_note
-            + f"\n\nRaw response: {resp.text[:200]}"
+            "\u26a0\ufe0f Gemini rejected the key (401/403).\n\n"
+            "Usually the key the app reads isn't the one you think it is. Check:\n"
+            "- secrets.toml has a `[gemini]` section header directly above `api_key` "
+            "(TOML scopes every key to the section above it)\n"
+            "- the file is saved to disk, and Streamlit has been fully restarted\n"
+            "- no stray quotes, whitespace or line breaks in the value\n\n"
+            "Verify the key from a terminal:\n"
+            "`curl \"https://generativelanguage.googleapis.com/v1beta/models?key=YOUR_KEY\"`"
+            f"\n\nRaw response: {resp.text[:200]}"
         )
     if resp.status_code == 404:
         return (
-            "⚠️ Model not found (404). `gemini-2.5-flash` may have been renamed or retired. "
-            "Check https://ai.google.dev/gemini-api/docs/models and update the model name "
-            "in ask_gym_bro().\n\n"
-            f"Details: {resp.text[:200]}"
+            f"\u26a0\ufe0f Model not found (404). `{GEMINI_MODEL}` may have been renamed "
+            "or retired. List what your key can reach:\n\n"
+            "`curl \"https://generativelanguage.googleapis.com/v1beta/models?key=YOUR_KEY\"`"
+            "\n\nthen update GEMINI_MODEL near the top of the Gym Bro section."
+            f"\n\nDetails: {resp.text[:200]}"
         )
     if resp.status_code == 429:
-        return "⚠️ Gemini rate limit hit (429). Give it a minute and try again."
+        return "\u26a0\ufe0f Gemini rate limit hit (429). Give it a minute and try again."
     if resp.status_code == 400:
-        return (
-            "⚠️ Gemini rejected the request (400). Usually a truncated key, or the model "
-            f"isn't available to your account.\n\nDetails: {resp.text[:250]}"
-        )
-    return f"⚠️ Gemini returned HTTP {resp.status_code}: {resp.text[:300]}"
+        return ("\u26a0\ufe0f Gemini rejected the request (400). Often a malformed tool "
+                f"declaration or an unavailable model.\n\nDetails: {resp.text[:300]}")
+    return f"\u26a0\ufe0f Gemini returned HTTP {resp.status_code}: {resp.text[:300]}"
+
+
+def ask_gym_bro(user_message, chat_history, profile, targets):
+    """Answer a question, letting Gemini query the user's own logged data.
+
+    Flow: send the question with the tool declarations attached. If the model
+    replies with functionCall parts, run those functions locally, append the
+    results, and ask again. Repeat until it produces text or we hit
+    MAX_TOOL_ROUNDS.
+
+    Returns None (not an error string) when no API key is configured, which is
+    how the caller knows to show the 'add a key' message instead.
+    """
+    if not get_gemini_api_key():
+        return None
+
+    system_prompt = (
+        GYM_BRO_SYSTEM_PROMPT
+        + f"\n\nToday's date is {date.today().isoformat()} "
+          f"({WEEKDAY_NAMES[date.today().weekday()]}). Resolve relative dates like "
+          f"'yesterday' or 'last week' against this."
+        + f"\n\nQuick context (use tools for anything more specific): "
+          f"goal {profile.get('goal')}, activity {profile.get('activity_level')}, "
+          f"protein target {targets.get('protein_min')}-{targets.get('protein_max')}g, "
+          f"steps target {targets.get('steps_min')}-{targets.get('steps_max')}."
+    )
+
+    contents = [
+        {"role": "user" if role == "user" else "model", "parts": [{"text": text}]}
+        for role, text in chat_history[-10:]
+    ]
+    contents.append({"role": "user", "parts": [{"text": user_message}]})
+
+    tools_used = []
+
+    for _ in range(MAX_TOOL_ROUNDS):
+        try:
+            resp = _gemini_call(contents, system_prompt, tools=GYM_BRO_TOOLS)
+        except Exception as e:
+            return f"\u26a0\ufe0f Couldn't reach Gemini: {e}"
+
+        if resp.status_code != 200:
+            return _gemini_error_message(resp)
+
+        try:
+            candidates = resp.json().get("candidates") or []
+            if not candidates:
+                return ("\u26a0\ufe0f Gemini returned no answer — it may have been blocked "
+                        "by a safety filter. Try rephrasing.")
+            parts = candidates[0].get("content", {}).get("parts", []) or []
+        except Exception:
+            return f"\u26a0\ufe0f Couldn't parse Gemini's reply: {resp.text[:300]}"
+
+        calls = [p["functionCall"] for p in parts if "functionCall" in p]
+
+        if not calls:
+            text = "".join(p.get("text", "") for p in parts).strip()
+            if not text:
+                return "\u26a0\ufe0f Gemini returned an empty reply. Try rephrasing."
+            return text
+
+        # Model asked for data — run the requested lookups and feed them back.
+        contents.append({"role": "model", "parts": parts})
+        tool_parts = []
+        for call in calls:
+            name = call.get("name", "")
+            args = call.get("args") or {}
+            tools_used.append(name)
+            fn = GYM_BRO_TOOL_DISPATCH.get(name)
+            if fn is None:
+                result = {"error": f"Unknown tool '{name}'."}
+            else:
+                try:
+                    result = fn(**args)
+                except TypeError as e:
+                    result = {"error": f"Bad arguments for {name}: {e}"}
+                except Exception as e:
+                    result = {"error": f"{type(e).__name__} while running {name}: {e}"}
+            if not isinstance(result, dict):
+                result = {"result": result}
+            tool_parts.append({"functionResponse": {
+                "name": name, "response": _json_safe(result)}})
+        contents.append({"role": "user", "parts": tool_parts})
+
+    return ("\u26a0\ufe0f Gym Bro kept looking things up without settling on an answer "
+            f"(tried: {', '.join(tools_used[:8])}). Try asking something narrower.")
 
 def render_gym_bro_widget():
     """Single floating chat bubble, available on every page.
@@ -3256,7 +3582,6 @@ elif page == t("nav_today"):
 
                 st.markdown("---")
                 # ---------------- DEMO / FORM ----------------
-                st.markdown("---")
                 if info:
                     render_exercise_demo(info, effective_name)
                 else:
@@ -3412,7 +3737,15 @@ elif page == t("nav_today"):
                 min_value=0.0, value=float(row["protein_g"] or 0), step=5.0,
                 key=f"protein_{log_date_str}")
             if st.button(t("use_meal_total"), key=f"use_meal_protein_{log_date_str}"):
-                protein = day_meal_protein_total
+                # Assigning to `protein` here did nothing: the click triggers a
+                # rerun, so the save button never fires on this pass and the
+                # number_input re-renders from its own widget state. Write into
+                # the widget's session key instead, then rerun. Read the total
+                # straight from the DB so it doesn't depend on tab render order.
+                _md = get_meal_details(log_date_str)
+                st.session_state[f"protein_{log_date_str}"] = float(
+                    sum(d["protein_g"] for d in _md.values()))
+                st.rerun()
         with n2:
             water = st.number_input(
                 f"{t('water_label')} — target {TARGETS['water_min']}-{TARGETS['water_max']}L",
