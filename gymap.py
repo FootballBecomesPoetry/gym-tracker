@@ -1130,15 +1130,37 @@ def fetch(query, params=()):
         return cols, rows
 
 # ---------------------------------------------------------------
+# CURRENT USER
+# ---------------------------------------------------------------
+# Every query below filters on this. It's read from the module global that the
+# UI section sets once per script run, rather than being threaded through fifty
+# function signatures — Python resolves globals at call time, so by the time any
+# of these run, authentication has already resolved.
+#
+# The fallback matters: a few functions can be reached before auth resolves (and
+# in single-user mode CURRENT_USER_ID is never set to anything else), so falling
+# back to SINGLE_USER_ID keeps the app working rather than throwing.
+
+def current_user_id():
+    """The user_id every query filters on."""
+    uid = globals().get("CURRENT_USER_ID")
+    if uid is None or uid == "DENIED":
+        return SINGLE_USER_ID
+    return uid
+
+
+# ---------------------------------------------------------------
 # SETTINGS / TARGETS
 # ---------------------------------------------------------------
 def get_setting(key, default=None):
-    cols, rows = fetch("SELECT value FROM app_settings WHERE key=%s", (key,))
+    cols, rows = fetch("SELECT value FROM app_settings WHERE user_id=%s AND key=%s",
+                       (current_user_id(), key))
     return rows[0][0] if rows else default
 
 def set_setting(key, value):
-    run("""INSERT INTO app_settings (key, value) VALUES (%s, %s)
-           ON CONFLICT (key) DO UPDATE SET value=excluded.value""", (key, str(value)))
+    run("""INSERT INTO app_settings (user_id, key, value) VALUES (%s, %s, %s)
+           ON CONFLICT (user_id, key) DO UPDATE SET value=excluded.value""",
+        (current_user_id(), key, str(value)))
 
 def load_targets():
     targets = DEFAULT_TARGETS.copy()
@@ -1156,7 +1178,7 @@ def save_targets(new_targets):
 # PROFILE
 # ---------------------------------------------------------------
 def get_profile():
-    cols, rows = fetch("SELECT * FROM profile WHERE id=1")
+    cols, rows = fetch("SELECT * FROM profile WHERE user_id=%s", (current_user_id(),))
     if not rows:
         return {"goal": GOALS[2], "height_cm": None, "weight_kg": None, "age": None,
                 "sex": SEX_OPTIONS[2], "country": "", "activity_level": ACTIVITY_LEVELS[2]}
@@ -1164,13 +1186,13 @@ def get_profile():
 
 def save_profile(goal, height_cm, weight_kg, age, sex, country, activity_level):
     run("""
-        INSERT INTO profile (id, goal, height_cm, weight_kg, age, sex, country, activity_level)
-        VALUES (1, %s, %s, %s, %s, %s, %s, %s)
-        ON CONFLICT (id) DO UPDATE SET
+        INSERT INTO profile (user_id, goal, height_cm, weight_kg, age, sex, country, activity_level)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (user_id) DO UPDATE SET
             goal=excluded.goal, height_cm=excluded.height_cm, weight_kg=excluded.weight_kg,
             age=excluded.age, sex=excluded.sex, country=excluded.country,
             activity_level=excluded.activity_level
-    """, (goal, height_cm, weight_kg, age, sex, country, activity_level))
+    """, (current_user_id(), goal, height_cm, weight_kg, age, sex, country, activity_level))
 
 def compute_targets_from_profile(profile):
     """Standard BMR/TDEE-based estimate. Not medical advice — a sensible starting point."""
@@ -1216,74 +1238,92 @@ def compute_targets_from_profile(profile):
 # DAILY LOG / MEALS / EXERCISES
 # ---------------------------------------------------------------
 def get_daily_row(log_date):
-    cols, rows = fetch("SELECT * FROM daily_log WHERE log_date = %s", (log_date,))
+    uid = current_user_id()
+    cols, rows = fetch("SELECT * FROM daily_log WHERE user_id=%s AND log_date=%s",
+                       (uid, log_date))
     if not rows:
-        run("INSERT INTO daily_log (log_date) VALUES (%s)", (log_date,))
-        return {"log_date": log_date, "protein_g": 0, "water_l": 0, "steps": 0, "weight_kg": None, "notes": ""}
+        run("INSERT INTO daily_log (user_id, log_date) VALUES (%s, %s) "
+            "ON CONFLICT (user_id, log_date) DO NOTHING", (uid, log_date))
+        return {"log_date": log_date, "protein_g": 0, "water_l": 0, "steps": 0,
+                "weight_kg": None, "notes": ""}
     return dict(zip(cols, rows[0]))
 
 def save_daily_row(log_date, protein_g, water_l, steps, weight_kg, notes):
-    run("""UPDATE daily_log SET protein_g=%s, water_l=%s, steps=%s, weight_kg=%s, notes=%s
-           WHERE log_date=%s""", (protein_g, water_l, steps, weight_kg, notes, log_date))
+    run("""INSERT INTO daily_log (user_id, log_date, protein_g, water_l, steps, weight_kg, notes)
+           VALUES (%s, %s, %s, %s, %s, %s, %s)
+           ON CONFLICT (user_id, log_date) DO UPDATE SET
+           protein_g=excluded.protein_g, water_l=excluded.water_l, steps=excluded.steps,
+           weight_kg=excluded.weight_kg, notes=excluded.notes""",
+        (current_user_id(), log_date, protein_g, water_l, steps, weight_kg, notes))
 
 def get_meal_checks(log_date):
-    cols, rows = fetch("SELECT meal, done FROM meal_checks WHERE log_date=%s", (log_date,))
+    cols, rows = fetch("SELECT meal, done FROM meal_checks WHERE user_id=%s AND log_date=%s",
+                       (current_user_id(), log_date))
     existing = dict(rows)
     return {m: bool(existing.get(m, 0)) for m in MEALS}
 
 def set_meal_check(log_date, meal, done):
-    run("""INSERT INTO meal_checks (log_date, meal, done) VALUES (%s, %s, %s)
-           ON CONFLICT (log_date, meal) DO UPDATE SET done=excluded.done""", (log_date, meal, int(done)))
+    run("""INSERT INTO meal_checks (user_id, log_date, meal, done) VALUES (%s, %s, %s, %s)
+           ON CONFLICT (user_id, log_date, meal) DO UPDATE SET done=excluded.done""",
+        (current_user_id(), log_date, meal, int(done)))
 
 def get_meal_details(log_date):
     cols, rows = fetch(
-        "SELECT meal, note, calories, protein_g FROM meal_details WHERE log_date=%s", (log_date,))
+        "SELECT meal, note, calories, protein_g FROM meal_details "
+        "WHERE user_id=%s AND log_date=%s", (current_user_id(), log_date))
     existing = {r[0]: {"note": r[1] or "", "calories": r[2] or 0, "protein_g": r[3] or 0} for r in rows}
     return {m: existing.get(m, {"note": "", "calories": 0, "protein_g": 0}) for m in MEALS}
 
 def set_meal_detail(log_date, meal, note, calories, protein_g):
-    run("""INSERT INTO meal_details (log_date, meal, note, calories, protein_g) VALUES (%s, %s, %s, %s, %s)
-           ON CONFLICT (log_date, meal) DO UPDATE SET
+    run("""INSERT INTO meal_details (user_id, log_date, meal, note, calories, protein_g)
+           VALUES (%s, %s, %s, %s, %s, %s)
+           ON CONFLICT (user_id, log_date, meal) DO UPDATE SET
            note=excluded.note, calories=excluded.calories, protein_g=excluded.protein_g""",
-        (log_date, meal, note, calories, protein_g))
+        (current_user_id(), log_date, meal, note, calories, protein_g))
 
 def get_exercise_checks(log_date, exercises):
-    cols, rows = fetch("SELECT exercise, done FROM exercise_checks WHERE log_date=%s", (log_date,))
+    cols, rows = fetch("SELECT exercise, done FROM exercise_checks "
+                       "WHERE user_id=%s AND log_date=%s", (current_user_id(), log_date))
     existing = dict(rows)
     return {e: bool(existing.get(e, 0)) for e in exercises}
 
 def set_exercise_check(log_date, exercise, done):
-    run("""INSERT INTO exercise_checks (log_date, exercise, done) VALUES (%s, %s, %s)
-           ON CONFLICT (log_date, exercise) DO UPDATE SET done=excluded.done""",
-        (log_date, exercise, int(done)))
+    run("""INSERT INTO exercise_checks (user_id, log_date, exercise, done)
+           VALUES (%s, %s, %s, %s)
+           ON CONFLICT (user_id, log_date, exercise) DO UPDATE SET done=excluded.done""",
+        (current_user_id(), log_date, exercise, int(done)))
 
 def get_all_logged_exercises(log_date):
     """All exercise_checks rows for a date, including anything added beyond the fixed plan."""
-    cols, rows = fetch("SELECT exercise, done FROM exercise_checks WHERE log_date=%s", (log_date,))
+    cols, rows = fetch("SELECT exercise, done FROM exercise_checks "
+                       "WHERE user_id=%s AND log_date=%s", (current_user_id(), log_date))
     return dict(rows)
 
 def remove_exercise(log_date, exercise):
-    run("DELETE FROM exercise_checks WHERE log_date=%s AND exercise=%s", (log_date, exercise))
+    run("DELETE FROM exercise_checks WHERE user_id=%s AND log_date=%s AND exercise=%s",
+        (current_user_id(), log_date, exercise))
 
-# ---- NEW: exercise swaps (e.g. "did Pull Ups instead of Deadlift today") ----
+# ---- exercise swaps (e.g. "did Pull Ups instead of Deadlift today") ----
 def get_exercise_swap(log_date, original_exercise):
     """Returns the replacement name for this original exercise on this date, or None."""
     cols, rows = fetch(
-        "SELECT replacement_exercise FROM exercise_swaps WHERE log_date=%s AND original_exercise=%s",
-        (log_date, original_exercise))
+        "SELECT replacement_exercise FROM exercise_swaps "
+        "WHERE user_id=%s AND log_date=%s AND original_exercise=%s",
+        (current_user_id(), log_date, original_exercise))
     return rows[0][0] if rows else None
 
 def set_exercise_swap(log_date, original_exercise, replacement_exercise):
-    run("""INSERT INTO exercise_swaps (log_date, original_exercise, replacement_exercise)
-           VALUES (%s, %s, %s)
-           ON CONFLICT (log_date, original_exercise) DO UPDATE SET
+    run("""INSERT INTO exercise_swaps (user_id, log_date, original_exercise, replacement_exercise)
+           VALUES (%s, %s, %s, %s)
+           ON CONFLICT (user_id, log_date, original_exercise) DO UPDATE SET
            replacement_exercise=excluded.replacement_exercise""",
-        (log_date, original_exercise, replacement_exercise))
+        (current_user_id(), log_date, original_exercise, replacement_exercise))
 
 def get_all_swaps(log_date):
     """{original_exercise: replacement_exercise} for one date."""
     cols, rows = fetch("""SELECT original_exercise, replacement_exercise
-                          FROM exercise_swaps WHERE log_date=%s""", (log_date,))
+                          FROM exercise_swaps WHERE user_id=%s AND log_date=%s""",
+                       (current_user_id(), log_date))
     return dict(rows)
 
 
@@ -1305,8 +1345,9 @@ def effective_exercises_for_day(log_date, planned_exercises):
     for extra in get_all_logged_exercises(log_date):
         if extra not in names and extra not in planned_exercises:
             names.append(extra)
-    cols, rows = fetch("SELECT DISTINCT exercise FROM exercise_sets WHERE log_date=%s",
-                       (log_date,))
+    cols, rows = fetch("SELECT DISTINCT exercise FROM exercise_sets "
+                       "WHERE user_id=%s AND log_date=%s",
+                       (current_user_id(), log_date))
     for (name,) in rows:
         if name not in names:
             names.append(name)
@@ -1314,61 +1355,75 @@ def effective_exercises_for_day(log_date, planned_exercises):
 
 
 def remove_exercise_swap(log_date, original_exercise):
-    run("DELETE FROM exercise_swaps WHERE log_date=%s AND original_exercise=%s",
-        (log_date, original_exercise))
+    run("DELETE FROM exercise_swaps WHERE user_id=%s AND log_date=%s "
+        "AND original_exercise=%s", (current_user_id(), log_date, original_exercise))
 
 def get_range_df(start, end):
-    q = "SELECT * FROM daily_log WHERE log_date BETWEEN %s AND %s ORDER BY log_date"
-    return pd.read_sql_query(q, get_live_conn(), params=(start.isoformat(), end.isoformat()))
+    q = ("SELECT * FROM daily_log WHERE user_id=%s AND log_date BETWEEN %s AND %s "
+         "ORDER BY log_date")
+    return pd.read_sql_query(q, get_live_conn(),
+                             params=(current_user_id(), start.isoformat(), end.isoformat()))
 
 def get_meal_completion_for_range(start, end):
     q = """SELECT log_date, SUM(done) as done_count FROM meal_checks
-           WHERE log_date BETWEEN %s AND %s GROUP BY log_date"""
-    return pd.read_sql_query(q, get_live_conn(), params=(start.isoformat(), end.isoformat()))
+           WHERE user_id=%s AND log_date BETWEEN %s AND %s GROUP BY log_date"""
+    return pd.read_sql_query(q, get_live_conn(),
+                             params=(current_user_id(), start.isoformat(), end.isoformat()))
 
 def get_exercise_completion_for_range(start, end):
     q = """SELECT log_date, COUNT(*) as total, SUM(done) as done_count FROM exercise_checks
-           WHERE log_date BETWEEN %s AND %s GROUP BY log_date"""
-    return pd.read_sql_query(q, get_live_conn(), params=(start.isoformat(), end.isoformat()))
+           WHERE user_id=%s AND log_date BETWEEN %s AND %s GROUP BY log_date"""
+    return pd.read_sql_query(q, get_live_conn(),
+                             params=(current_user_id(), start.isoformat(), end.isoformat()))
 
 def get_meal_macro_totals_for_range(start, end):
     q = """SELECT log_date, SUM(calories) as calories_total, SUM(protein_g) as meal_protein_total
-           FROM meal_details WHERE log_date BETWEEN %s AND %s GROUP BY log_date"""
-    return pd.read_sql_query(q, get_live_conn(), params=(start.isoformat(), end.isoformat()))
+           FROM meal_details WHERE user_id=%s AND log_date BETWEEN %s AND %s GROUP BY log_date"""
+    return pd.read_sql_query(q, get_live_conn(),
+                             params=(current_user_id(), start.isoformat(), end.isoformat()))
 
 # ---------------------------------------------------------------
 # BODY MEASUREMENTS
 # ---------------------------------------------------------------
 def get_measurement_row(log_date):
-    cols, rows = fetch("SELECT * FROM body_measurements WHERE log_date=%s", (log_date,))
+    cols, rows = fetch("SELECT * FROM body_measurements WHERE user_id=%s AND log_date=%s",
+                       (current_user_id(), log_date))
     if not rows:
         return {"waist_cm": None, "chest_cm": None, "hips_cm": None, "arms_cm": None, "thighs_cm": None}
     return dict(zip(cols, rows[0]))
 
 def save_measurement(log_date, waist, chest, hips, arms, thighs):
-    run("""INSERT INTO body_measurements (log_date, waist_cm, chest_cm, hips_cm, arms_cm, thighs_cm)
-           VALUES (%s, %s, %s, %s, %s, %s)
-           ON CONFLICT (log_date) DO UPDATE SET
+    run("""INSERT INTO body_measurements
+             (user_id, log_date, waist_cm, chest_cm, hips_cm, arms_cm, thighs_cm)
+           VALUES (%s, %s, %s, %s, %s, %s, %s)
+           ON CONFLICT (user_id, log_date) DO UPDATE SET
            waist_cm=excluded.waist_cm, chest_cm=excluded.chest_cm, hips_cm=excluded.hips_cm,
            arms_cm=excluded.arms_cm, thighs_cm=excluded.thighs_cm""",
-        (log_date, waist, chest, hips, arms, thighs))
+        (current_user_id(), log_date, waist, chest, hips, arms, thighs))
 
 def get_all_measurements():
-    return pd.read_sql_query("SELECT * FROM body_measurements ORDER BY log_date", get_live_conn())
+    return pd.read_sql_query(
+        "SELECT * FROM body_measurements WHERE user_id=%s ORDER BY log_date",
+        get_live_conn(), params=(current_user_id(),))
 
 # ---------------------------------------------------------------
 # PROGRESS PHOTOS
 # ---------------------------------------------------------------
 def save_photo(log_date, caption, photo_bytes):
-    run("INSERT INTO progress_photos (log_date, caption, photo_data) VALUES (%s, %s, %s)",
-        (log_date, caption, psycopg2.Binary(photo_bytes)))
+    run("INSERT INTO progress_photos (user_id, log_date, caption, photo_data) "
+        "VALUES (%s, %s, %s, %s)",
+        (current_user_id(), log_date, caption, psycopg2.Binary(photo_bytes)))
 
 def get_all_photos():
-    cols, rows = fetch("SELECT id, log_date, caption, photo_data FROM progress_photos ORDER BY log_date DESC")
+    cols, rows = fetch("SELECT id, log_date, caption, photo_data FROM progress_photos "
+                       "WHERE user_id=%s ORDER BY log_date DESC", (current_user_id(),))
     return [dict(zip(cols, r)) for r in rows]
 
 def delete_photo(photo_id):
-    run("DELETE FROM progress_photos WHERE id=%s", (photo_id,))
+    # user_id in the WHERE clause as well as the id: without it, a stale photo id
+    # from another session could delete someone else's row.
+    run("DELETE FROM progress_photos WHERE user_id=%s AND id=%s",
+        (current_user_id(), photo_id))
 
 # ---------------------------------------------------------------
 # WORKOUT PLAN (editable in-app, seeded from GYM_SPLIT defaults)
@@ -1382,40 +1437,48 @@ def repair_set_numbering():
     """
     if get_setting("set_numbering_repaired") == "1":
         return
+    uid = current_user_id()
     cols, rows = fetch("""SELECT log_date, exercise FROM exercise_sets
+                          WHERE user_id=%s
                           GROUP BY log_date, exercise
                           HAVING MIN(set_number) > 1
-                              OR MAX(set_number) <> COUNT(*)""")
+                              OR MAX(set_number) <> COUNT(*)""", (uid,))
     for log_date, exercise in rows:
         _, ordered = fetch("""SELECT set_number FROM exercise_sets
-                              WHERE log_date=%s AND exercise=%s
-                              ORDER BY set_number""", (log_date, exercise))
+                              WHERE user_id=%s AND log_date=%s AND exercise=%s
+                              ORDER BY set_number""", (uid, log_date, exercise))
         for new_num, (old_num,) in enumerate([r for r in ordered], start=1):
             if old_num != new_num:
                 run("""UPDATE exercise_sets SET set_number=%s
-                       WHERE log_date=%s AND exercise=%s AND set_number=%s""",
-                    (new_num, log_date, exercise, old_num))
+                       WHERE user_id=%s AND log_date=%s AND exercise=%s AND set_number=%s""",
+                    (new_num, uid, log_date, exercise, old_num))
     set_setting("set_numbering_repaired", "1")
 
 
 def seed_plan_if_empty():
-    """First run: copy the hardcoded GYM_SPLIT defaults into the DB."""
-    _, rows = fetch("SELECT COUNT(*) FROM workout_plan")
+    """First run for THIS user: copy the hardcoded GYM_SPLIT defaults into the DB.
+
+    Per-user, not global — a new account needs its own plan rows, otherwise it
+    would land on an empty split.
+    """
+    uid = current_user_id()
+    _, rows = fetch("SELECT COUNT(*) FROM workout_plan WHERE user_id=%s", (uid,))
     if rows and rows[0][0] > 0:
         return
     for weekday, plan in GYM_SPLIT.items():
         for i, ex in enumerate(plan["exercises"]):
-            run("""INSERT INTO workout_plan (weekday, position, exercise, day_label)
-                   VALUES (%s, %s, %s, %s)
-                   ON CONFLICT (weekday, position) DO NOTHING""",
-                (weekday, i, ex, plan["label"]))
+            run("""INSERT INTO workout_plan (user_id, weekday, position, exercise, day_label)
+                   VALUES (%s, %s, %s, %s, %s)
+                   ON CONFLICT (user_id, weekday, position) DO NOTHING""",
+                (uid, weekday, i, ex, plan["label"]))
 
 
 def load_plan():
     """Returns the same shape as GYM_SPLIT, but read from the DB."""
     seed_plan_if_empty()
     cols, rows = fetch(
-        "SELECT weekday, position, exercise, day_label FROM workout_plan ORDER BY weekday, position")
+        "SELECT weekday, position, exercise, day_label FROM workout_plan "
+        "WHERE user_id=%s ORDER BY weekday, position", (current_user_id(),))
     plan = {}
     for weekday, position, exercise, day_label in rows:
         entry = plan.setdefault(weekday, {"label": day_label or "", "exercises": []})
@@ -1430,12 +1493,13 @@ def load_plan():
 
 
 def save_plan_day(weekday, day_label, exercises):
-    run("DELETE FROM workout_plan WHERE weekday=%s", (weekday,))
+    uid = current_user_id()
+    run("DELETE FROM workout_plan WHERE user_id=%s AND weekday=%s", (uid, weekday))
     for i, ex in enumerate(exercises):
         ex = ex.strip()
         if ex:
-            run("""INSERT INTO workout_plan (weekday, position, exercise, day_label)
-                   VALUES (%s, %s, %s, %s)""", (weekday, i, ex, day_label))
+            run("""INSERT INTO workout_plan (user_id, weekday, position, exercise, day_label)
+                   VALUES (%s, %s, %s, %s, %s)""", (uid, weekday, i, ex, day_label))
 
 
 def reset_plan_day(weekday):
@@ -1451,8 +1515,9 @@ def get_sets(log_date, exercise):
     cols, rows = fetch("""SELECT set_number, reps, weight_kg,
                                  COALESCE(duration_min,0), COALESCE(distance_km,0)
                           FROM exercise_sets
-                          WHERE log_date=%s AND exercise=%s ORDER BY set_number""",
-                       (log_date, exercise))
+                          WHERE user_id=%s AND log_date=%s AND exercise=%s
+                          ORDER BY set_number""",
+                       (current_user_id(), log_date, exercise))
     return [{"set_number": r[0], "reps": r[1] or 0, "weight_kg": r[2] or 0.0,
              "duration_min": r[3] or 0.0, "distance_km": r[4] or 0.0} for r in rows]
 
@@ -1460,47 +1525,42 @@ def get_sets(log_date, exercise):
 def save_set(log_date, exercise, set_number, reps, weight_kg,
              duration_min=0, distance_km=0):
     run("""INSERT INTO exercise_sets
-             (log_date, exercise, set_number, reps, weight_kg, duration_min, distance_km)
-           VALUES (%s, %s, %s, %s, %s, %s, %s)
-           ON CONFLICT (log_date, exercise, set_number) DO UPDATE SET
+             (user_id, log_date, exercise, set_number, reps, weight_kg, duration_min, distance_km)
+           VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+           ON CONFLICT (user_id, log_date, exercise, set_number) DO UPDATE SET
            reps=excluded.reps, weight_kg=excluded.weight_kg,
            duration_min=excluded.duration_min, distance_km=excluded.distance_km""",
-        (log_date, exercise, set_number, int(reps or 0), float(weight_kg or 0),
-         float(duration_min or 0), float(distance_km or 0)))
+        (current_user_id(), log_date, exercise, set_number, int(reps or 0),
+         float(weight_kg or 0), float(duration_min or 0), float(distance_km or 0)))
 
 
 # ---------------------------------------------------------------
 # PER-EXERCISE LOGGING PREFERENCES
 # ---------------------------------------------------------------
 def _all_exercise_prefs():
-    """Every exercise preference in one query, held for the current script run.
+    """Every preference for the current user in one query, held for this run.
 
     get_exercise_pref() used to fire a SELECT every time it was called — once
     per set widget, once per row in each volume calculation, once per PR lookup.
-    A single Today page could issue a hundred round trips to Supabase. This
-    loads the lot once and reuses it.
+    A single Today page could issue a hundred round trips.
 
-    Invalidation is explicit rather than time-based: set_exercise_pref() bumps
-    the version counter, so a changed preference is visible on the very next
-    rerun. A TTL cache would have left the per-hand toggle looking broken for
-    however long the TTL was.
+    The cache lives in session_state, which is per browser session and therefore
+    already per user. The version counter invalidates it the moment a preference
+    changes, so the per-hand toggle still takes effect on the next rerun.
     """
     version = st.session_state.get("_prefs_version", 0)
     cached = st.session_state.get("_prefs_cache")
     if cached is not None and cached[0] == version:
         return cached[1]
-    cols, rows = fetch("SELECT exercise, log_type, per_side FROM exercise_prefs")
+    cols, rows = fetch("SELECT exercise, log_type, per_side FROM exercise_prefs "
+                       "WHERE user_id=%s", (current_user_id(),))
     prefs = {r[0]: {"log_type": r[1], "per_side": bool(r[2])} for r in rows}
     st.session_state["_prefs_cache"] = (version, prefs)
     return prefs
 
 
 def get_exercise_pref(exercise):
-    """How to log this movement, and whether the weight entered is per-hand.
-
-    Defaults come from EXERCISE_INFO, but the user can override per exercise and
-    the choice sticks for every future session.
-    """
+    """How to log this movement, and whether the weight entered is per-hand."""
     entry = _all_exercise_prefs().get(exercise)
     if entry:
         return {"log_type": entry["log_type"] or default_log_type(exercise),
@@ -1509,11 +1569,11 @@ def get_exercise_pref(exercise):
 
 
 def set_exercise_pref(exercise, log_type, per_side):
-    run("""INSERT INTO exercise_prefs (exercise, log_type, per_side) VALUES (%s, %s, %s)
-           ON CONFLICT (exercise) DO UPDATE SET
+    run("""INSERT INTO exercise_prefs (user_id, exercise, log_type, per_side)
+           VALUES (%s, %s, %s, %s)
+           ON CONFLICT (user_id, exercise) DO UPDATE SET
            log_type=excluded.log_type, per_side=excluded.per_side""",
-        (exercise, log_type, int(bool(per_side))))
-    # Invalidate the per-run cache so the change shows immediately.
+        (current_user_id(), exercise, log_type, int(bool(per_side))))
     st.session_state["_prefs_version"] = st.session_state.get("_prefs_version", 0) + 1
 
 
@@ -1530,33 +1590,32 @@ def next_set_number(log_date, exercise):
     would skip set 1 and then repeatedly overwrite set 2.
     """
     cols, rows = fetch("""SELECT COALESCE(MAX(set_number), 0) FROM exercise_sets
-                          WHERE log_date=%s AND exercise=%s""", (log_date, exercise))
+                          WHERE user_id=%s AND log_date=%s AND exercise=%s""",
+                       (current_user_id(), log_date, exercise))
     return (rows[0][0] if rows else 0) + 1
 
 
 def renumber_sets(log_date, exercise):
     """Close any gaps so sets read 1, 2, 3... after a delete."""
+    uid = current_user_id()
     existing = get_sets(log_date, exercise)
     for i, entry in enumerate(existing, start=1):
         if entry["set_number"] != i:
             run("""UPDATE exercise_sets SET set_number=%s
-                   WHERE log_date=%s AND exercise=%s AND set_number=%s""",
-                (i, log_date, exercise, entry["set_number"]))
+                   WHERE user_id=%s AND log_date=%s AND exercise=%s AND set_number=%s""",
+                (i, uid, log_date, exercise, entry["set_number"]))
 
 
 def delete_last_set(log_date, exercise):
-    run("""DELETE FROM exercise_sets WHERE log_date=%s AND exercise=%s
+    uid = current_user_id()
+    run("""DELETE FROM exercise_sets WHERE user_id=%s AND log_date=%s AND exercise=%s
            AND set_number = (SELECT MAX(set_number) FROM exercise_sets
-                             WHERE log_date=%s AND exercise=%s)""",
-        (log_date, exercise, log_date, exercise))
+                             WHERE user_id=%s AND log_date=%s AND exercise=%s)""",
+        (uid, log_date, exercise, uid, log_date, exercise))
 
 
 def get_last_session_peak(exercise, before_date):
-    """Heaviest set from the most recent previous session of this exercise.
-
-    Distinct from get_best_ever: this is "what did I hit LAST time", which is
-    the number you're usually trying to match or beat today.
-    """
+    """Heaviest set from the most recent previous session of this exercise."""
     prev_date, prev_sets = get_last_session(exercise, before_date)
     if not prev_sets:
         return None
@@ -1574,18 +1633,17 @@ def get_last_session_peak(exercise, before_date):
 
 
 def get_best_ever(exercise, before_date=None):
-    """Heaviest set and best estimated 1RM ever logged for this exercise.
-
-    Returns None if nothing's been logged. `before_date` excludes today so you
-    can show "beat this" rather than comparing against the set you just typed.
-    """
+    """Heaviest set and best estimated 1RM ever logged for this exercise."""
+    uid = current_user_id()
     if before_date:
         cols, rows = fetch("""SELECT reps, weight_kg, log_date FROM exercise_sets
-                              WHERE exercise=%s AND weight_kg > 0 AND reps > 0
-                              AND log_date < %s""", (exercise, before_date))
+                              WHERE user_id=%s AND exercise=%s
+                              AND weight_kg > 0 AND reps > 0
+                              AND log_date < %s""", (uid, exercise, before_date))
     else:
         cols, rows = fetch("""SELECT reps, weight_kg, log_date FROM exercise_sets
-                              WHERE exercise=%s AND weight_kg > 0 AND reps > 0""", (exercise,))
+                              WHERE user_id=%s AND exercise=%s
+                              AND weight_kg > 0 AND reps > 0""", (uid, exercise))
     if not rows:
         return None
     per_side = get_exercise_pref(exercise)["per_side"]
@@ -1603,15 +1661,11 @@ def get_best_ever(exercise, before_date=None):
 
 
 def get_last_session(exercise, before_date):
-    """Most recent day BEFORE `before_date` where this exercise had logged sets.
-
-    This powers the 'Last time: 80kg x 8, 80kg x 7' hint — the single most
-    useful thing to see while standing in the gym.
-    """
+    """Most recent day BEFORE `before_date` where this exercise had logged sets."""
     cols, rows = fetch("""SELECT MAX(log_date) FROM exercise_sets
-                          WHERE exercise=%s AND log_date < %s
+                          WHERE user_id=%s AND exercise=%s AND log_date < %s
                           AND (reps > 0 OR weight_kg > 0)""",
-                       (exercise, before_date))
+                       (current_user_id(), exercise, before_date))
     if not rows or not rows[0][0]:
         return None, []
     prev_date = rows[0][0]
@@ -1619,34 +1673,38 @@ def get_last_session(exercise, before_date):
 
 
 def get_exercise_note(log_date, exercise):
-    cols, rows = fetch("SELECT note FROM exercise_notes WHERE log_date=%s AND exercise=%s",
-                       (log_date, exercise))
+    cols, rows = fetch("SELECT note FROM exercise_notes "
+                       "WHERE user_id=%s AND log_date=%s AND exercise=%s",
+                       (current_user_id(), log_date, exercise))
     return rows[0][0] if rows else ""
 
 
 def set_exercise_note(log_date, exercise, note):
-    run("""INSERT INTO exercise_notes (log_date, exercise, note) VALUES (%s, %s, %s)
-           ON CONFLICT (log_date, exercise) DO UPDATE SET note=excluded.note""",
-        (log_date, exercise, note))
+    run("""INSERT INTO exercise_notes (user_id, log_date, exercise, note)
+           VALUES (%s, %s, %s, %s)
+           ON CONFLICT (user_id, log_date, exercise) DO UPDATE SET note=excluded.note""",
+        (current_user_id(), log_date, exercise, note))
 
 
 def get_all_sets_df():
     return pd.read_sql_query(
         "SELECT log_date, exercise, set_number, reps, weight_kg FROM exercise_sets "
-        "ORDER BY log_date, exercise, set_number", get_live_conn())
+        "WHERE user_id=%s ORDER BY log_date, exercise, set_number",
+        get_live_conn(), params=(current_user_id(),))
 
 
 def get_sets_for_range(start, end):
     return pd.read_sql_query(
         "SELECT log_date, exercise, set_number, reps, weight_kg FROM exercise_sets "
-        "WHERE log_date BETWEEN %s AND %s ORDER BY log_date",
-        get_live_conn(), params=(start.isoformat(), end.isoformat()))
+        "WHERE user_id=%s AND log_date BETWEEN %s AND %s ORDER BY log_date",
+        get_live_conn(), params=(current_user_id(), start.isoformat(), end.isoformat()))
 
 
 def get_logged_exercise_names():
     """Distinct exercises that have any set data — for the strength-trend picker."""
     cols, rows = fetch("""SELECT DISTINCT exercise FROM exercise_sets
-                          WHERE weight_kg > 0 ORDER BY exercise""")
+                          WHERE user_id=%s AND weight_kg > 0 ORDER BY exercise""",
+                       (current_user_id(),))
     return [r[0] for r in rows]
 
 
@@ -1654,30 +1712,39 @@ def get_logged_exercise_names():
 # REST / DELOAD WEEKS
 # ---------------------------------------------------------------
 def is_rest_week(week_start):
-    cols, rows = fetch("SELECT 1 FROM rest_weeks WHERE week_start=%s", (week_start.isoformat(),))
+    cols, rows = fetch("SELECT 1 FROM rest_weeks WHERE user_id=%s AND week_start=%s",
+                       (current_user_id(), week_start.isoformat()))
     return bool(rows)
 
 
 def set_rest_week(week_start, enabled):
     if enabled:
-        run("INSERT INTO rest_weeks (week_start) VALUES (%s) ON CONFLICT DO NOTHING",
-            (week_start.isoformat(),))
+        run("INSERT INTO rest_weeks (user_id, week_start) VALUES (%s, %s) "
+            "ON CONFLICT DO NOTHING", (current_user_id(), week_start.isoformat()))
     else:
-        run("DELETE FROM rest_weeks WHERE week_start=%s", (week_start.isoformat(),))
+        run("DELETE FROM rest_weeks WHERE user_id=%s AND week_start=%s",
+            (current_user_id(), week_start.isoformat()))
 # ---------------------------------------------------------------
 # STREAKS & BADGES
 # ---------------------------------------------------------------
 def get_active_dates_df():
+    uid = current_user_id()
+    # The user filter has to be inside each subquery as well as on the outer
+    # table. Filtering only the outer query would still join in every other
+    # user's meal and exercise counts for the same dates.
     cols, rows = fetch("""
         SELECT d.log_date, COALESCE(d.protein_g,0) as protein_g, COALESCE(d.water_l,0) as water_l,
                COALESCE(d.steps,0) as steps, COALESCE(m.done_count,0) as meals_done,
                COALESCE(e.done_count,0) as ex_done
         FROM daily_log d
-        LEFT JOIN (SELECT log_date, SUM(done) as done_count FROM meal_checks GROUP BY log_date) m
+        LEFT JOIN (SELECT log_date, SUM(done) as done_count FROM meal_checks
+                   WHERE user_id=%s GROUP BY log_date) m
             ON d.log_date = m.log_date
-        LEFT JOIN (SELECT log_date, SUM(done) as done_count FROM exercise_checks GROUP BY log_date) e
+        LEFT JOIN (SELECT log_date, SUM(done) as done_count FROM exercise_checks
+                   WHERE user_id=%s GROUP BY log_date) e
             ON d.log_date = e.log_date
-    """)
+        WHERE d.user_id=%s
+    """, (uid, uid, uid))
     df = pd.DataFrame(rows, columns=cols)
     if df.empty:
         return df
@@ -1814,17 +1881,24 @@ def render_perfect_day_celebration():
 # LIFETIME STATS, PERSONAL RECORDS & ACHIEVEMENTS
 # ---------------------------------------------------------------
 @st.cache_data(ttl=60, show_spinner=False)
-def compute_perfect_days_count(targets):
+def compute_perfect_days_count(targets, _user_id=None):
+    # _user_id is part of the cache KEY, not just the query. Without it in the
+    # signature, Streamlit would hand the second user the first user's cached
+    # result — the cache is global, not per session.
+    uid = _user_id if _user_id is not None else current_user_id()
     cols, rows = fetch("""
         SELECT d.log_date, COALESCE(d.protein_g,0) as protein_g, COALESCE(d.water_l,0) as water_l,
                COALESCE(d.steps,0) as steps, COALESCE(m.done_count,0) as meals_done,
                COALESCE(e.done_count,0) as ex_done
         FROM daily_log d
-        LEFT JOIN (SELECT log_date, SUM(done) as done_count FROM meal_checks GROUP BY log_date) m
+        LEFT JOIN (SELECT log_date, SUM(done) as done_count FROM meal_checks
+                   WHERE user_id=%s GROUP BY log_date) m
             ON d.log_date = m.log_date
-        LEFT JOIN (SELECT log_date, SUM(done) as done_count FROM exercise_checks GROUP BY log_date) e
+        LEFT JOIN (SELECT log_date, SUM(done) as done_count FROM exercise_checks
+                   WHERE user_id=%s GROUP BY log_date) e
             ON d.log_date = e.log_date
-    """)
+        WHERE d.user_id=%s
+    """, (uid, uid, uid))
     df = pd.DataFrame(rows, columns=cols)
     if df.empty:
         return 0
@@ -1842,30 +1916,37 @@ def compute_perfect_days_count(targets):
     return count
 
 @st.cache_data(ttl=60, show_spinner=False)
-def get_lifetime_stats(targets):
+def get_lifetime_stats(targets, _user_id=None):
+    # _user_id is in the signature so it forms part of the cache key. A cached
+    # value keyed only on `targets` would leak one user's lifetime totals to
+    # anyone whose targets happened to match.
+    uid = _user_id if _user_id is not None else current_user_id()
     cols, rows = fetch("""
         SELECT COALESCE(SUM(steps),0), COALESCE(SUM(protein_g),0), COALESCE(SUM(water_l),0),
                COALESCE(MAX(steps),0), COALESCE(MAX(protein_g),0),
                COALESCE(SUM(CASE WHEN weight_kg IS NOT NULL AND weight_kg > 0 THEN 1 ELSE 0 END),0)
-        FROM daily_log
-    """)
+        FROM daily_log WHERE user_id=%s
+    """, (uid,))
     lifetime_steps, lifetime_protein, lifetime_water, max_steps_day, max_protein_day, weight_entries = \
         rows[0] if rows else (0, 0, 0, 0, 0, 0)
 
-    _, wo_rows = fetch("SELECT COUNT(*) FROM exercise_checks WHERE done=1")
+    _, wo_rows = fetch("SELECT COUNT(*) FROM exercise_checks WHERE user_id=%s AND done=1",
+                       (uid,))
     total_workouts = wo_rows[0][0] if wo_rows else 0
 
-    _, meal_rows = fetch("SELECT COUNT(*) FROM meal_checks WHERE done=1")
+    _, meal_rows = fetch("SELECT COUNT(*) FROM meal_checks WHERE user_id=%s AND done=1",
+                         (uid,))
     total_meals = meal_rows[0][0] if meal_rows else 0
 
-    _, photo_rows = fetch("SELECT COUNT(*) FROM progress_photos")
+    _, photo_rows = fetch("SELECT COUNT(*) FROM progress_photos WHERE user_id=%s", (uid,))
     total_photos = photo_rows[0][0] if photo_rows else 0
 
-    _, bfast_rows = fetch("SELECT COUNT(*) FROM meal_checks WHERE meal='Breakfast' AND done=1")
+    _, bfast_rows = fetch("SELECT COUNT(*) FROM meal_checks "
+                          "WHERE user_id=%s AND meal='Breakfast' AND done=1", (uid,))
     first_breakfast = (bfast_rows[0][0] if bfast_rows else 0) > 0
 
     streak, longest, total_active_days = compute_streak_stats()
-    perfect_days = compute_perfect_days_count(targets)
+    perfect_days = compute_perfect_days_count(targets, _user_id=uid)
 
     return {
         "lifetime_steps": lifetime_steps, "lifetime_protein": lifetime_protein,
@@ -2069,8 +2150,8 @@ SECONDS_REST_BETWEEN_SETS = 90.0
 def _bodyweight_kg(default=75.0):
     """Latest logged bodyweight, falling back to the profile, then a default."""
     cols, rows = fetch("""SELECT weight_kg FROM daily_log
-                          WHERE weight_kg IS NOT NULL AND weight_kg > 0
-                          ORDER BY log_date DESC LIMIT 1""")
+                          WHERE user_id=%s AND weight_kg IS NOT NULL AND weight_kg > 0
+                          ORDER BY log_date DESC LIMIT 1""", (current_user_id(),))
     if rows and rows[0][0]:
         return float(rows[0][0])
     profile = get_profile()
@@ -2148,7 +2229,8 @@ def get_lift_prs(limit=12):
     Ranked by estimated 1RM so a heavy triple beats a light set of 20.
     """
     cols, rows = fetch("""SELECT exercise, reps, weight_kg, log_date FROM exercise_sets
-                          WHERE weight_kg > 0 AND reps > 0""")
+                          WHERE user_id=%s AND weight_kg > 0 AND reps > 0""",
+                       (current_user_id(),))
     best = {}
     per_side_cache = {}
     for exercise, reps, weight, log_date in rows:
@@ -2167,8 +2249,9 @@ def get_lift_prs(limit=12):
 def get_strength_trend(exercise):
     """Per-session best estimated 1RM for one exercise, as a tidy DataFrame."""
     cols, rows = fetch("""SELECT log_date, reps, weight_kg FROM exercise_sets
-                          WHERE exercise=%s AND weight_kg > 0 AND reps > 0
-                          ORDER BY log_date""", (exercise,))
+                          WHERE user_id=%s AND exercise=%s
+                          AND weight_kg > 0 AND reps > 0
+                          ORDER BY log_date""", (current_user_id(), exercise))
     if not rows:
         return pd.DataFrame()
     per_side = get_exercise_pref(exercise)["per_side"]
@@ -2398,7 +2481,8 @@ def _match_exercise_name(name):
     Returns (resolved_name, candidates). Falls back to the app's own fuzzy
     exercise lookup so 'bench' finds 'Bench Press'.
     """
-    cols, rows = fetch("SELECT DISTINCT exercise FROM exercise_sets")
+    cols, rows = fetch("SELECT DISTINCT exercise FROM exercise_sets WHERE user_id=%s",
+                       (current_user_id(),))
     known = [r[0] for r in rows]
     if not name:
         return None, known
@@ -2488,9 +2572,10 @@ def _gb_exercise_history(exercise=None, days=None):
     cols, rows = fetch("""SELECT log_date, set_number, reps, weight_kg,
                                  COALESCE(duration_min,0), COALESCE(distance_km,0)
                           FROM exercise_sets
-                          WHERE exercise=%s AND log_date BETWEEN %s AND %s
+                          WHERE user_id=%s AND exercise=%s
+                          AND log_date BETWEEN %s AND %s
                           ORDER BY log_date, set_number""",
-                       (resolved, start.isoformat(), end.isoformat()))
+                       (current_user_id(), resolved, start.isoformat(), end.isoformat()))
     per_side = get_exercise_pref(resolved)["per_side"]
     sessions = {}
     for log_date, n, reps, weight, dur, dist in rows:
@@ -2554,7 +2639,7 @@ def _gb_measurements(days=None):
 def _gb_streaks_and_totals():
     """Streak, days logged, and lifetime totals."""
     streak, longest, total_days = compute_streak_stats()
-    stats = get_lifetime_stats(load_targets())
+    stats = get_lifetime_stats(load_targets(), _user_id=current_user_id())
     return {"current_streak_days": streak, "longest_streak_days": longest,
             "days_logged": total_days, "lifetime": stats}
 
@@ -3387,10 +3472,157 @@ def render_muscle_heatmap(volume_by_region):
     return True
 
 
+
+# ---------------------------------------------------------------
+# AUTHENTICATION (stage 1 of multi-user)
+# ---------------------------------------------------------------
+# Sign-in uses Streamlit's built-in OIDC support, so no password ever touches
+# this app: Google authenticates the person and hands back a verified email.
+#
+# Identity is stored as a small integer user_id in the `users` table rather than
+# the email itself. Two reasons: the email then lives in exactly one row instead
+# of being copied across every workout set you've ever logged, and swapping
+# provider later (GitHub, say) means updating one mapping row rather than
+# rewriting the whole database.
+#
+# STAGE 1 SCOPE: this resolves who you are. It does NOT yet filter data by user —
+# every query still returns the same rows it always did. Stages 2 and 3 add the
+# user_id columns and the WHERE clauses.
+
+SINGLE_USER_ID = 1          # the implicit user all existing data belongs to
+
+
+def auth_is_configured():
+    """True when secrets.toml has an [auth] section for Streamlit to use."""
+    try:
+        return "auth" in st.secrets and bool(st.secrets["auth"])
+    except Exception:
+        return False
+
+
+def _allowed_emails():
+    """Optional allowlist. Absent or empty means anyone who signs in is allowed.
+
+    Set it in secrets.toml as:
+        [auth]
+        allowed_emails = ["you@gmail.com", "mate@gmail.com"]
+    """
+    try:
+        raw = st.secrets["auth"].get("allowed_emails")
+    except Exception:
+        return None
+    if not raw:
+        return None
+    return {str(e).strip().lower() for e in raw if str(e).strip()}
+
+
+def ensure_users_table():
+    run("""CREATE TABLE IF NOT EXISTS users (
+        user_id SERIAL PRIMARY KEY,
+        email TEXT UNIQUE NOT NULL,
+        display_name TEXT,
+        created_at TIMESTAMP DEFAULT now(),
+        last_seen TIMESTAMP DEFAULT now())""")
+
+
+def get_or_create_user(email, display_name=None):
+    """Resolve an email to a stable integer user_id, creating the row if new.
+
+    The first account created takes user_id 1, which is the id all pre-existing
+    data is assigned to in stage 2. So sign in with your own account first.
+    """
+    email = (email or "").strip().lower()
+    if not email:
+        return None
+    ensure_users_table()
+    cols, rows = fetch("SELECT user_id FROM users WHERE email=%s", (email,))
+    if rows:
+        uid = rows[0][0]
+        run("UPDATE users SET last_seen=now(), display_name=COALESCE(%s, display_name) "
+            "WHERE user_id=%s", (display_name, uid))
+        return uid
+    run("INSERT INTO users (email, display_name) VALUES (%s, %s) "
+        "ON CONFLICT (email) DO NOTHING", (email, display_name))
+    cols, rows = fetch("SELECT user_id FROM users WHERE email=%s", (email,))
+    return rows[0][0] if rows else None
+
+
+def current_user():
+    """Who is this? Returns (user_id, email, display_name).
+
+    Falls back to the single-user identity when auth isn't configured, so the
+    app keeps working before Google credentials are in place.
+    """
+    if not auth_is_configured():
+        return SINGLE_USER_ID, None, None
+
+    user = getattr(st, "user", None)
+    if user is None or not getattr(user, "is_logged_in", False):
+        return None, None, None
+
+    email = (getattr(user, "email", "") or "").strip().lower()
+    name = getattr(user, "name", None)
+
+    allowed = _allowed_emails()
+    if allowed is not None and email not in allowed:
+        return "DENIED", email, name
+
+    cached = st.session_state.get("_auth_user")
+    if cached and cached[1] == email:
+        return cached
+    resolved = (get_or_create_user(email, name), email, name)
+    st.session_state["_auth_user"] = resolved
+    return resolved
+
+
+def render_login_gate():
+    """Show the sign-in screen and stop the script. Returns nothing."""
+    st.markdown("### ⚡ Momentum")
+    st.write("Sign in to reach your training log.")
+    if hasattr(st, "login"):
+        st.button("Sign in with Google", type="primary",
+                  on_click=lambda: st.login("google"))
+    else:
+        st.error(
+            "This version of Streamlit has no built-in login. "
+            "Run `pip install --upgrade streamlit` (1.42 or newer is required), "
+            "or remove the [auth] section from secrets.toml to go back to "
+            "single-user mode.")
+    st.stop()
+
+
+def render_account_box():
+    """Sidebar footer: who's signed in, and a way out."""
+    if not auth_is_configured():
+        st.caption("👤 Single-user mode — sign-in not configured yet.")
+        return
+    user = getattr(st, "user", None)
+    label = (getattr(user, "name", None) or getattr(user, "email", None) or "Signed in")
+    st.caption(f"👤 {label}")
+    if hasattr(st, "logout"):
+        st.button("Sign out", key="_logout_btn", use_container_width=True,
+                  on_click=st.logout)
+
+
 # ---------------------------------------------------------------
 # UI
 # ---------------------------------------------------------------
 st.set_page_config(page_title="Momentum", page_icon="⚡", layout="centered")
+
+# --- Who is using the app? ---------------------------------------------------
+# Resolved before anything reads the database. In stage 1 this only gates access;
+# from stage 3 onward CURRENT_USER_ID is what every query filters on.
+CURRENT_USER_ID, CURRENT_USER_EMAIL, CURRENT_USER_NAME = current_user()
+
+if CURRENT_USER_ID == "DENIED":
+    st.error("That account isn't on the allowlist for this app.")
+    st.caption(f"Signed in as {CURRENT_USER_EMAIL}")
+    if hasattr(st, "logout"):
+        st.button("Sign out", on_click=st.logout)
+    st.stop()
+
+if CURRENT_USER_ID is None:
+    render_login_gate()
 
 if "language" not in st.session_state:
     st.session_state.language = get_setting("language", "English")
@@ -3405,6 +3637,7 @@ with st.sidebar:
         set_setting("language", lang_choice)
         st.rerun()
     st.caption("💡 Tip: use the ⋮ menu (top right) → Settings → Theme for light/dark mode.")
+    render_account_box()
     page = st.radio(
         t("app_title"),
         [t("nav_home"), t("nav_today"), t("nav_weight_log"), t("nav_weekly_dashboard"),
@@ -4232,7 +4465,7 @@ elif page == t("nav_photos"):
 
 elif page == t("nav_achievements"):
     st.subheader(t("achievements_header"))
-    stats = get_lifetime_stats(TARGETS)
+    stats = get_lifetime_stats(TARGETS, _user_id=current_user_id())
     achievements = get_achievement_status(stats)
     unlocked = [a for a in achievements if a[2]]
     st.caption(f"{len(unlocked)}/{len(achievements)} {t('achievements_unlocked')}")
