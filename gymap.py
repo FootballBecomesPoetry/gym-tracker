@@ -7,7 +7,34 @@ import pandas as pd
 import numpy as np
 import plotly.express as px
 import base64
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
+
+# ---------------------------------------------------------------
+# LOCAL TIME
+# ---------------------------------------------------------------
+# date.today() reads the SERVER clock. Streamlit Community Cloud runs UTC, so
+# between midnight and 1am BST the app would file a session under yesterday —
+# and silently break the streak. Everything below resolves "today" in the zone
+# below instead.
+#
+# Windows ships no timezone database, so ZoneInfo raises there unless the
+# `tzdata` package is installed. The fallback keeps the app running rather than
+# crashing; it just reverts to the old server-clock behaviour.
+APP_TIMEZONE = "Europe/London"
+
+try:
+    from zoneinfo import ZoneInfo
+    _APP_TZ = ZoneInfo(APP_TIMEZONE)
+except Exception:
+    _APP_TZ = None
+
+
+def local_today():
+    """Today's date in APP_TIMEZONE, falling back to the server clock."""
+    if _APP_TZ is None:
+        return date.today()
+    return datetime.now(_APP_TZ).date()
+
 
 # NOTE: Gym Bro talks to the Gemini REST endpoint directly with `requests` — no
 # Google SDK. It uses function calling: the tools declared in GYM_BRO_TOOLS let
@@ -255,6 +282,7 @@ def all_known_exercise_names():
     return sorted(names)
 
 
+@st.cache_data(ttl=600, show_spinner=False)
 def exercise_muscle_filters():
     """Clean muscle groups for the swap filter dropdown.
 
@@ -268,6 +296,7 @@ def exercise_muscle_filters():
     return sorted(groups)
 
 
+@st.cache_data(ttl=600, show_spinner=False)
 def search_exercises(query="", muscle=None, limit=400):
     """Filter the exercise catalogue by free-text query and/or muscle group.
 
@@ -1042,6 +1071,19 @@ def get_conn():
         PRIMARY KEY (weekday, position))""")
     # NEW: deload / rest weeks (keyed by the Monday of that week)
     cur.execute("""CREATE TABLE IF NOT EXISTS rest_weeks (week_start TEXT PRIMARY KEY)""")
+    # Indexes on the columns every query filters by. Without these, Postgres
+    # scans the whole table for each lookup — fine at 50 rows, not at 50,000.
+    for _idx, _spec in (
+        ("idx_sets_exercise_date", "exercise_sets (exercise, log_date)"),
+        ("idx_sets_date", "exercise_sets (log_date)"),
+        ("idx_checks_date", "exercise_checks (log_date)"),
+        ("idx_meal_checks_date", "meal_checks (log_date)"),
+        ("idx_meal_details_date", "meal_details (log_date)"),
+    ):
+        try:
+            cur.execute(f"CREATE INDEX IF NOT EXISTS {_idx} ON {_spec}")
+        except Exception:
+            pass
     cur.close()
     return conn
 
@@ -1430,17 +1472,39 @@ def save_set(log_date, exercise, set_number, reps, weight_kg,
 # ---------------------------------------------------------------
 # PER-EXERCISE LOGGING PREFERENCES
 # ---------------------------------------------------------------
+def _all_exercise_prefs():
+    """Every exercise preference in one query, held for the current script run.
+
+    get_exercise_pref() used to fire a SELECT every time it was called — once
+    per set widget, once per row in each volume calculation, once per PR lookup.
+    A single Today page could issue a hundred round trips to Supabase. This
+    loads the lot once and reuses it.
+
+    Invalidation is explicit rather than time-based: set_exercise_pref() bumps
+    the version counter, so a changed preference is visible on the very next
+    rerun. A TTL cache would have left the per-hand toggle looking broken for
+    however long the TTL was.
+    """
+    version = st.session_state.get("_prefs_version", 0)
+    cached = st.session_state.get("_prefs_cache")
+    if cached is not None and cached[0] == version:
+        return cached[1]
+    cols, rows = fetch("SELECT exercise, log_type, per_side FROM exercise_prefs")
+    prefs = {r[0]: {"log_type": r[1], "per_side": bool(r[2])} for r in rows}
+    st.session_state["_prefs_cache"] = (version, prefs)
+    return prefs
+
+
 def get_exercise_pref(exercise):
     """How to log this movement, and whether the weight entered is per-hand.
 
     Defaults come from EXERCISE_INFO, but the user can override per exercise and
     the choice sticks for every future session.
     """
-    cols, rows = fetch("SELECT log_type, per_side FROM exercise_prefs WHERE exercise=%s",
-                       (exercise,))
-    if rows:
-        return {"log_type": rows[0][0] or default_log_type(exercise),
-                "per_side": bool(rows[0][1])}
+    entry = _all_exercise_prefs().get(exercise)
+    if entry:
+        return {"log_type": entry["log_type"] or default_log_type(exercise),
+                "per_side": entry["per_side"]}
     return {"log_type": default_log_type(exercise), "per_side": False}
 
 
@@ -1449,6 +1513,8 @@ def set_exercise_pref(exercise, log_type, per_side):
            ON CONFLICT (exercise) DO UPDATE SET
            log_type=excluded.log_type, per_side=excluded.per_side""",
         (exercise, log_type, int(bool(per_side))))
+    # Invalidate the per-run cache so the change shows immediately.
+    st.session_state["_prefs_version"] = st.session_state.get("_prefs_version", 0) + 1
 
 
 def effective_load(weight_kg, per_side):
@@ -1633,7 +1699,7 @@ def compute_streak_stats():
             longest = max(longest, current_run)
             current_run = 1
     longest = max(longest, current_run)
-    today = date.today()
+    today = local_today()
     streak, check = 0, today
     while check in date_set:
         streak += 1
@@ -1718,7 +1784,7 @@ def render_momentum_score_badge(score):
       <div class="score-num">{score} / 100</div>
     </div>
     """
-    components.html(html, height=100)
+    components.html(html, height=92)
 
 def render_perfect_day_celebration():
     html = """
@@ -1747,6 +1813,7 @@ def render_perfect_day_celebration():
 # ---------------------------------------------------------------
 # LIFETIME STATS, PERSONAL RECORDS & ACHIEVEMENTS
 # ---------------------------------------------------------------
+@st.cache_data(ttl=60, show_spinner=False)
 def compute_perfect_days_count(targets):
     cols, rows = fetch("""
         SELECT d.log_date, COALESCE(d.protein_g,0) as protein_g, COALESCE(d.water_l,0) as water_l,
@@ -1774,6 +1841,7 @@ def compute_perfect_days_count(targets):
             count += 1
     return count
 
+@st.cache_data(ttl=60, show_spinner=False)
 def get_lifetime_stats(targets):
     cols, rows = fetch("""
         SELECT COALESCE(SUM(steps),0), COALESCE(SUM(protein_g),0), COALESCE(SUM(water_l),0),
@@ -1957,7 +2025,7 @@ QUOTES = [item["quote"] for item in DAILY_INSPIRATION]
 def get_daily_inspiration():
     """Same pairing every day, rotating through the list — so the quote and the
     verse always share a theme rather than being picked independently."""
-    return DAILY_INSPIRATION[date.today().toordinal() % len(DAILY_INSPIRATION)]
+    return DAILY_INSPIRATION[local_today().toordinal() % len(DAILY_INSPIRATION)]
 
 
 def get_daily_quote():
@@ -2307,7 +2375,7 @@ def _json_safe(obj):
 
 def _resolve_dates(days=None, start_date=None, end_date=None, default_days=14):
     """Turn the model's loose date arguments into a concrete (start, end) pair."""
-    today = date.today()
+    today = local_today()
     end = today
     if end_date:
         try:
@@ -2373,9 +2441,9 @@ def _gb_daily_numbers(days=None, start_date=None, end_date=None):
 def _gb_workout_on(date_str=None):
     """What was planned and what was actually logged on one date."""
     try:
-        d = date.fromisoformat(str(date_str)[:10]) if date_str else date.today()
+        d = date.fromisoformat(str(date_str)[:10]) if date_str else local_today()
     except ValueError:
-        d = date.today()
+        d = local_today()
     ds = d.isoformat()
     weekday = WEEKDAY_NAMES[d.weekday()]
     day_plan = PLAN.get(weekday, {"label": weekday, "exercises": []})
@@ -2468,7 +2536,7 @@ def _gb_muscle_volume(days=None):
 def _gb_profile_and_targets():
     """The user's profile and their current daily targets."""
     return {"profile": get_profile(), "targets": load_targets(),
-            "today": date.today().isoformat()}
+            "today": local_today().isoformat()}
 
 
 def _gb_measurements(days=None):
@@ -2629,8 +2697,8 @@ def ask_gym_bro(user_message, chat_history, profile, targets):
 
     system_prompt = (
         GYM_BRO_SYSTEM_PROMPT
-        + f"\n\nToday's date is {date.today().isoformat()} "
-          f"({WEEKDAY_NAMES[date.today().weekday()]}). Resolve relative dates like "
+        + f"\n\nToday's date is {local_today().isoformat()} "
+          f"({WEEKDAY_NAMES[local_today().weekday()]}). Resolve relative dates like "
           f"'yesterday' or 'last week' against this."
         + f"\n\nQuick context (use tools for anything more specific): "
           f"goal {profile.get('goal')}, activity {profile.get('activity_level')}, "
@@ -2784,24 +2852,56 @@ def render_gym_bro_widget():
 # WEIGHT PREDICTION
 # ---------------------------------------------------------------
 def compute_weight_prediction():
-    df = get_range_df(date.today() - timedelta(days=180), date.today())
+    """Linear projection of bodyweight, with guards against nonsense.
+
+    A naive polyfit over a couple of noisy weeks will happily project a 30kg
+    loss. Four guards stop that:
+      - needs at least 4 entries spanning 14+ days, so one heavy-then-light
+        fortnight can't set the trend
+      - dates are rebased to "days since first entry" before fitting. Fitting
+        against raw ordinals (~739,000) makes the intercept enormous, and any
+        later adjustment to the slope then gets multiplied by that number.
+      - the slope is clamped to +/- 0.15 kg/day (about 1kg a week), beyond which
+        a straight line isn't describing anything real
+      - projection is anchored to the fitted value at the LAST weigh-in and
+        extended forward, so a clamped slope can't drag the whole line with it
+    """
+    df = get_range_df(local_today() - timedelta(days=180), local_today())
     df = df.dropna(subset=["weight_kg"])
-    if len(df) < 2:
+    if len(df) < 4:
         return None
     df["log_date"] = pd.to_datetime(df["log_date"])
     df = df.sort_values("log_date")
     span_days = (df["log_date"].iloc[-1] - df["log_date"].iloc[0]).days
-    if span_days < 7:
+    if span_days < 14:
         return None
 
-    x = df["log_date"].map(pd.Timestamp.toordinal).to_numpy()
-    y = df["weight_kg"].to_numpy()
+    ordinals = df["log_date"].map(pd.Timestamp.toordinal).to_numpy(dtype=float)
+    x = ordinals - ordinals[0]          # days since the first weigh-in
+    y = df["weight_kg"].to_numpy(dtype=float)
     slope, intercept = np.polyfit(x, y, 1)
 
-    today_ord = date.today().toordinal()
-    pred_30 = slope * (today_ord + 30) + intercept
-    pred_90 = slope * (today_ord + 90) + intercept
-    return {"current": float(y[-1]), "pred_30": float(pred_30), "pred_90": float(pred_90)}
+    residuals = y - (slope * x + intercept)
+    band = float(np.std(residuals)) * 1.96 if len(y) > 2 else 0.0
+    band = max(band, 0.3)
+
+    MAX_KG_PER_DAY = 0.15
+    clamped = bool(abs(slope) > MAX_KG_PER_DAY)
+    safe_slope = max(-MAX_KG_PER_DAY, min(MAX_KG_PER_DAY, float(slope)))
+
+    # Anchor on the fitted value at the last weigh-in, then extend. Using the
+    # raw intercept with a clamped slope would shift the entire line.
+    anchor = float(slope * x[-1] + intercept)
+
+    def project(days_ahead):
+        return max(30.0, anchor + safe_slope * days_ahead)
+
+    return {
+        "current": float(y[-1]),
+        "pred_30": project(30), "pred_90": project(90),
+        "band": band, "slope_per_week": safe_slope * 7,
+        "clamped": clamped, "n": int(len(y)), "span_days": int(span_days),
+    }
 
 # ---------------------------------------------------------------
 # BOTTLE ANIMATION
@@ -2840,7 +2940,7 @@ def render_confetti():
     draw();
     </script>
     """
-    components.html(html, height=170)
+    components.html(html, height=128)
 
 def render_meal_stamp():
     html = """
@@ -2858,11 +2958,12 @@ def render_meal_stamp():
     </style>
     <div class="stamp">✅ DONE</div>
     """
-    components.html(html, height=40)
+    components.html(html, height=36)
 
 def render_animated_number(value, suffix="kg", duration_ms=900):
     html = f"""
-    <div style="font-size:2rem; font-weight:700;" id="counter">0{suffix}</div>
+    <div style="font-size:2rem; font-weight:700; color:#3b82f6;"
+         id="counter">0{suffix}</div>
     <script>
     let start = null; const target = {value}; const duration = {duration_ms};
     function step(ts){{
@@ -2875,7 +2976,7 @@ def render_animated_number(value, suffix="kg", duration_ms=900):
     requestAnimationFrame(step);
     </script>
     """
-    components.html(html, height=60)
+    components.html(html, height=52)
 
 def render_trend_arrow(delta, unit="kg"):
     color = "#ef4444" if delta > 0 else ("#10b981" if delta < 0 else "#6b7280")
@@ -2912,11 +3013,11 @@ def render_animated_bars(labels, values, max_value, value_suffix=""):
         pct_of_max = (val / max_value * 100) if max_value else 0
         bars += f"""
         <div class="bar-col" data-target="{pct_of_max}" style="display:flex;flex-direction:column;align-items:center;flex:1;">
-          <div style="font-size:0.7rem;margin-bottom:4px;">{val:.0f}{value_suffix}</div>
-          <div style="width:70%;height:120px;background:#eef2f7;border-radius:4px;display:flex;align-items:flex-end;overflow:hidden;">
-            <div class="bar-fill" style="width:100%;height:0%;background:#3b82f6;border-radius:4px 4px 0 0;transition:height 0.6s ease-out;"></div>
+          <div style="font-size:0.7rem;margin-bottom:4px;color:#e6edf3;font-weight:600;">{val:.0f}{value_suffix}</div>
+          <div style="width:70%;height:120px;background:rgba(147,163,184,0.18);border-radius:4px;display:flex;align-items:flex-end;overflow:hidden;">
+            <div class="bar-fill" style="width:100%;height:0%;background:linear-gradient(180deg,#8b5cf6,#3b82f6);border-radius:4px 4px 0 0;transition:height 0.6s ease-out;"></div>
           </div>
-          <div style="font-size:0.7rem;margin-top:4px;">{lab}</div>
+          <div style="font-size:0.7rem;margin-top:4px;color:#9aa5b1;">{lab}</div>
         </div>
         """
     html = f"""
@@ -2988,9 +3089,10 @@ def render_timeline_visual(dates):
     for i, d in enumerate(dates):
         dots += f"""
         <div style="display:flex; flex-direction:column; align-items:center; flex:1; min-width:60px;">
-          <div style="width:14px;height:14px;border-radius:50%;background:#3b82f6;
-                      border:2px solid white; box-shadow:0 0 0 2px #3b82f6;"></div>
-          <div style="font-size:0.65rem; margin-top:4px; text-align:center; color:#888;">{d}</div>
+          <div style="width:14px;height:14px;border-radius:50%;
+                      background:linear-gradient(135deg,#8b5cf6,#3b82f6);
+                      box-shadow:0 0 0 3px rgba(59,130,246,0.22);"></div>
+          <div style="font-size:0.65rem; margin-top:4px; text-align:center; color:#9aa5b1;">{d}</div>
         </div>
         """
     line_style = "flex:1; height:2px; background:#93a3b8; margin-top:6px;"
@@ -2999,7 +3101,7 @@ def render_timeline_visual(dates):
       {dots}
     </div>
     """
-    components.html(html, height=70)
+    components.html(html, height=62)
 
 def render_bottle(pct, message):
     pct = max(0, min(100, pct))
@@ -3024,21 +3126,26 @@ def render_bottle(pct, message):
                      C85,208 75,215 55,215 C35,215 25,208 25,195
                      L25,65 C25,45 40,35 40,35 Z"/>
           </clipPath>
+          <linearGradient id="bottleFill" x1="0" y1="1" x2="0" y2="0">
+            <stop offset="0%" stop-color="#3b82f6"/>
+            <stop offset="100%" stop-color="#8b5cf6"/>
+          </linearGradient>
         </defs>
         <path d="M40,10 L70,10 L70,35 C70,35 85,45 85,65 L85,195
                  C85,208 75,215 55,215 C35,215 25,208 25,195
                  L25,65 C25,45 40,35 40,35 Z"
-              fill="#eef2f7" stroke="#93a3b8" stroke-width="2"/>
+              fill="rgba(147,163,184,0.14)" stroke="rgba(147,163,184,0.55)" stroke-width="2"/>
         <rect x="0" y="{215 - (205 * pct / 100)}" width="110" height="{205 * pct / 100}"
-              fill="#3b82f6" clip-path="url(#bottleClip)"
+              fill="url(#bottleFill)" clip-path="url(#bottleClip)"
               style="transition: y 0.6s ease, height 0.6s ease;"/>
-        <rect x="42" y="2" width="26" height="12" rx="3" fill="#93a3b8"/>
+        <rect x="42" y="2" width="26" height="12" rx="3" fill="rgba(147,163,184,0.55)"/>
       </svg>
-      <div style="margin-top:8px; font-weight:600; font-size:0.95rem; text-align:center;">{pct:.0f}%</div>
-      <div style="margin-top:2px; font-size:0.9rem; text-align:center; color:#555;">{message}</div>
+      <div style="margin-top:8px; font-weight:700; font-size:1.05rem; text-align:center;
+                  color:#3b82f6;">{pct:.0f}%</div>
+      <div style="margin-top:2px; font-size:0.9rem; text-align:center; color:#9aa5b1;">{message}</div>
     </div>
     """
-    components.html(html, height=290)
+    components.html(html, height=268)
     if pct >= 100:
         render_confetti()
 
@@ -3053,6 +3160,56 @@ def get_bottle_message(pct):
         return t("bottle_25")
     else:
         return t("bottle_0")
+
+def render_clock():
+    """Ticking date + time in APP_TIMEZONE.
+
+    Runs entirely in the browser. Driving this from Python would mean a rerun
+    every second, and a Streamlit rerun re-executes the whole script — every
+    query on the page, once a second.
+
+    The zone is passed through from APP_TIMEZONE so this always agrees with
+    local_today(). If the clock reads 00:15 Thursday, Thursday is the date your
+    workout will be logged against.
+    """
+    zone = APP_TIMEZONE if _APP_TZ is not None else "UTC"
+    html = f"""
+    <div style="font-family:-apple-system,'Segoe UI',sans-serif;padding:2px 0 6px 0;">
+      <div id="mo-date" style="font-size:0.72rem;opacity:0.6;letter-spacing:0.02em;">
+        &nbsp;</div>
+      <div id="mo-time" style="font-size:1.35rem;font-weight:700;color:#3b82f6;
+                               font-variant-numeric:tabular-nums;line-height:1.2;">
+        --:--:--</div>
+    </div>
+    <script>
+    (function() {{
+      const zone = "{zone}";
+      const dateEl = document.getElementById('mo-date');
+      const timeEl = document.getElementById('mo-time');
+      function tick() {{
+        const now = new Date();
+        try {{
+          timeEl.innerText = now.toLocaleTimeString('en-GB', {{
+            timeZone: zone, hour: '2-digit', minute: '2-digit', second: '2-digit'
+          }});
+          dateEl.innerText = now.toLocaleDateString('en-GB', {{
+            timeZone: zone, weekday: 'short', day: 'numeric', month: 'short'
+          }});
+        }} catch (e) {{
+          // Unknown zone in this browser — fall back to the device clock rather
+          // than leaving the dashes on screen.
+          timeEl.innerText = now.toLocaleTimeString('en-GB');
+          dateEl.innerText = now.toLocaleDateString('en-GB',
+            {{ weekday: 'short', day: 'numeric', month: 'short' }});
+        }}
+      }}
+      tick();
+      setInterval(tick, 1000);
+    }})();
+    </script>
+    """
+    components.html(html, height=58)
+
 
 def render_exercise_demo(info, display_name):
     """Demo photos + target muscles + form cues for one exercise."""
@@ -3218,8 +3375,8 @@ def render_muscle_heatmap(volume_by_region):
                 f"<span style='width:11px;height:11px;border-radius:3px;flex:none;"
                 f"background:{shade(region)};display:inline-block;"
                 f"border:1px solid rgba(147,163,184,0.35);'></span>"
-                f"<span style='color:#9aa5b1;'>{region}</span>"
-                f"<span style='margin-left:auto;font-weight:600;color:#e6edf3;'>"
+                f"<span style='opacity:0.65;'>{region}</span>"
+                f"<span style='margin-left:auto;font-weight:600;color:inherit;'>"
                 f"{v:,.0f} kg</span></div>"
             )
         st.markdown(f"<div style='padding-top:14px;'>{rows}</div>",
@@ -3238,9 +3395,10 @@ st.set_page_config(page_title="Momentum", page_icon="⚡", layout="centered")
 if "language" not in st.session_state:
     st.session_state.language = get_setting("language", "English")
 if "selected_date" not in st.session_state:
-    st.session_state.selected_date = date.today()
+    st.session_state.selected_date = local_today()
 
 with st.sidebar:
+    render_clock()
     lang_choice = st.selectbox(t("language_label"), LANGUAGES, index=LANGUAGES.index(st.session_state.language))
     if lang_choice != st.session_state.language:
         st.session_state.language = lang_choice
@@ -3265,7 +3423,7 @@ st.title(t("app_title"))
 render_gym_bro_widget()
 
 if page == t("nav_home"):
-    today = date.today()
+    today = local_today()
     today_str = today.isoformat()
     weekday = WEEKDAY_NAMES[today.weekday()]
     day_plan = PLAN[weekday]
@@ -3273,40 +3431,42 @@ if page == t("nav_home"):
     streak, longest, total_days = compute_streak_stats()
     score = compute_momentum_score(today_str, weekday, TARGETS)
 
-    inspiration = get_daily_inspiration()
-    st.caption(t("quote_of_day_label"))
-    st.markdown(f"*{inspiration['quote']}*")
-    st.markdown(
-        f"<div style='border-left:3px solid #3b82f6;padding:6px 0 6px 12px;"
-        f"margin:8px 0 4px 0;'>"
-        f"<div style='font-size:0.92rem;font-style:italic;color:#c9d3de;'>"
-        f"&ldquo;{inspiration['verse']}&rdquo;</div>"
-        f"<div style='font-size:0.76rem;color:#8b95a1;margin-top:4px;'>"
-        f"{inspiration['ref']}</div></div>",
-        unsafe_allow_html=True)
+    # --- Weekly muscle volume: the most distinctive thing on this page, so it
+    # --- leads rather than sitting below four rows of metric cards.
+    st.markdown(f"#### {t('muscle_volume_header')}")
+    st.caption(t("muscle_volume_caption"))
+    wk_start = today - timedelta(days=today.weekday())
+    wk_end = wk_start + timedelta(days=6)
+    total_vol = get_total_volume_for_range(wk_start, wk_end)
+    if total_vol > 0:
+        st.caption(f"**{total_vol:,.0f} kg** {t('total_volume_label').lower()}")
+    if not render_muscle_heatmap(get_muscle_volume_for_range(wk_start, wk_end)):
+        st.info(t("no_volume_yet"))
 
-    h1, h2 = st.columns(2)
-    with h1:
-        render_momentum_score_badge(score)
-    with h2:
-        st.metric(t("current_streak_label"), f"{streak} 🔥")
+    st.markdown("---")
 
+    # --- Today at a glance ---
     latest_weight_df = get_range_df(today - timedelta(days=90), today).dropna(subset=["weight_kg"])
-    hw1, hw2, hw3 = st.columns(3)
-    with hw1:
-        if not latest_weight_df.empty:
-            hw1.metric(t("current_weight_home_label"), f"{latest_weight_df['weight_kg'].iloc[-1]:.1f} kg")
+    g1, g2, g3, g4 = st.columns(4)
+    g1.metric(t("momentum_score_label").replace("⚡ Today's ", ""), f"{score}")
+    g2.metric(t("current_streak_label"), f"{streak} 🔥")
+    if not latest_weight_df.empty:
+        g3.metric(t("current_weight_home_label"),
+                  f"{latest_weight_df['weight_kg'].iloc[-1]:.1f} kg")
+        week_ago_df = latest_weight_df[
+            pd.to_datetime(latest_weight_df["log_date"])
+            <= pd.Timestamp(today - timedelta(days=7))]
+        if not week_ago_df.empty:
+            change = (latest_weight_df["weight_kg"].iloc[-1]
+                      - week_ago_df["weight_kg"].iloc[-1])
+            g4.metric(t("weekly_change_label"), f"{change:+.1f} kg")
         else:
-            hw1.metric(t("current_weight_home_label"), "—")
-    with hw2:
-        week_ago_df = latest_weight_df[pd.to_datetime(latest_weight_df["log_date"]) <= pd.Timestamp(today - timedelta(days=7))]
-        if not latest_weight_df.empty and not week_ago_df.empty:
-            change = latest_weight_df["weight_kg"].iloc[-1] - week_ago_df["weight_kg"].iloc[-1]
-            hw2.metric(t("weekly_change_label"), f"{change:+.1f} kg")
-        else:
-            hw2.metric(t("weekly_change_label"), "—")
-    with hw3:
-        hw3.metric(t("todays_workout_label"), day_plan["label"])
+            g4.metric(t("weekly_change_label"), "—")
+    else:
+        g3.metric(t("current_weight_home_label"), "—")
+        g4.metric(t("weekly_change_label"), "—")
+
+    st.caption(f"**{t('todays_workout_label')}:** {day_plan['label']}")
 
     next_name, current, threshold = get_next_streak_badge(longest)
     if next_name:
@@ -3314,16 +3474,21 @@ if page == t("nav_home"):
     else:
         st.caption(f"{t('next_badge_label')}: 🏅 All streak badges unlocked!")
 
-    # Weekly muscle volume — the at-a-glance "what am I neglecting" view
-    st.markdown(f"#### {t('muscle_volume_header')}")
-    st.caption(t("muscle_volume_caption"))
-    wk_start = today - timedelta(days=today.weekday())
-    wk_end = wk_start + timedelta(days=6)
-    total_vol = get_total_volume_for_range(wk_start, wk_end)
-    if total_vol > 0:
-        st.metric(t("total_volume_label"), f"{total_vol:,.0f} kg")
-    if not render_muscle_heatmap(get_muscle_volume_for_range(wk_start, wk_end)):
-        st.info(t("no_volume_yet"))
+    st.markdown("---")
+
+    # --- Quote + verse, moved to the bottom: nice to have, not why you opened
+    # --- the app on a training day.
+    inspiration = get_daily_inspiration()
+    st.caption(t("quote_of_day_label"))
+    st.markdown(f"*{inspiration['quote']}*")
+    st.markdown(
+        f"<div style='border-left:3px solid #3b82f6;padding:6px 0 6px 12px;"
+        f"margin:8px 0 4px 0;'>"
+        f"<div style='font-size:0.92rem;font-style:italic;opacity:0.85;'>"
+        f"&ldquo;{inspiration['verse']}&rdquo;</div>"
+        f"<div style='font-size:0.76rem;opacity:0.6;margin-top:4px;'>"
+        f"{inspiration['ref']}</div></div>",
+        unsafe_allow_html=True)
 
 elif page == t("nav_today"):
     col1, col2, col3 = st.columns([1, 2, 1])
@@ -3800,7 +3965,7 @@ elif page == t("nav_today"):
                 st.write(f"• {f}")
 elif page == t("nav_weight_log"):
     st.subheader(t("weight_trend_header"))
-    end = date.today()
+    end = local_today()
     start = end - timedelta(days=90)
     df = get_range_df(start, end)
     df = df.dropna(subset=["weight_kg"])
@@ -3830,10 +3995,23 @@ elif page == t("nav_weight_log"):
     st.markdown(f"#### {t('prediction_header')}")
     prediction = compute_weight_prediction()
     if prediction:
+        band = prediction["band"]
         pr1, pr2 = st.columns(2)
-        pr1.metric(t("prediction_30"), f"{prediction['pred_30']:.1f} kg")
-        pr2.metric(t("prediction_90"), f"{prediction['pred_90']:.1f} kg")
-        st.caption("Based on your current weight trend — a simple linear projection, not a guarantee.")
+        pr1.metric(t("prediction_30"),
+                   f"{prediction['pred_30'] - band:.1f}–{prediction['pred_30'] + band:.1f} kg")
+        pr2.metric(t("prediction_90"),
+                   f"{prediction['pred_90'] - band:.1f}–{prediction['pred_90'] + band:.1f} kg")
+        st.caption(
+            f"Straight-line projection from {prediction['n']} weigh-ins over "
+            f"{prediction['span_days']} days — currently about "
+            f"{prediction['slope_per_week']:+.2f} kg/week. The range reflects how "
+            f"scattered your entries are around that line. It assumes nothing "
+            f"changes, which it will — treat it as a direction, not a forecast.")
+        if prediction["clamped"]:
+            st.caption(
+                "Your recent trend is steeper than a straight line can sensibly "
+                "extend, so the projection has been capped. Short-term swings are "
+                "usually water and food weight rather than real change.")
     else:
         st.info(t("prediction_insufficient"))
 
@@ -3855,7 +4033,7 @@ elif page == t("nav_weekly_dashboard"):
             if st.button(t("back_to_this_week"), key="reset_week_btn"):
                 st.session_state.week_offset = 0
 
-    today = date.today()
+    today = local_today()
     start_of_week = today - timedelta(days=today.weekday()) + timedelta(weeks=st.session_state.week_offset)
     end_of_week = start_of_week + timedelta(days=6)
     st.caption(f"{start_of_week.strftime('%d %b')} – {end_of_week.strftime('%d %b %Y')}")
@@ -3913,7 +4091,7 @@ elif page == t("nav_weekly_dashboard"):
     }), hide_index=True, use_container_width=True)
 
     with st.expander(t("advanced_trends_header"), expanded=False):
-        end30 = date.today()
+        end30 = local_today()
         start30 = end30 - timedelta(days=30)
         daily30 = get_range_df(start30, end30)
         macro30 = get_meal_macro_totals_for_range(start30, end30)
@@ -4227,7 +4405,7 @@ elif page == t("nav_settings"):
     st.caption(t("export_caption"))
     e1, e2, e3 = st.columns(3)
     with e1:
-        daily_all = get_range_df(date(2000, 1, 1), date.today())
+        daily_all = get_range_df(date(2000, 1, 1), local_today())
         st.download_button(t("download_daily"), daily_all.to_csv(index=False).encode("utf-8"),
                            file_name="momentum_daily_log.csv", mime="text/csv",
                            use_container_width=True)
