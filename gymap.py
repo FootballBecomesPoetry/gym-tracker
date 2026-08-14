@@ -587,7 +587,7 @@ BASE_EN = {
     "what_did_you_have": "What did you have?", "calories_label": "Calories", "protein_label": "Protein (g)",
     "use_meal_total": "Use meal total", "water_label": "Water (L)", "steps_label": "Steps",
     "weight_label": "Weight (kg)", "weight_trend_header": "⚖️ Weight Trend",
-    "no_weight_entries": "No weight entries yet. Log your weight on the Today page.",
+    "no_weight_entries": "No weigh-ins yet. Add one on the Today page under Numbers, and a trend line appears here once you have a few.",
     "latest_weight": "Latest weight", "change_period": "Change (period)", "entries_logged": "Entries logged",
     "weekly_adherence_header": "📅 Weekly Adherence", "meals_hit_avg": "Meals hit (avg)",
     "workouts_completed": "Workouts completed", "protein_target_days": "Protein target days",
@@ -712,7 +712,7 @@ BASE_EN = {
     "muscle_volume_caption": "Total kg lifted per muscle region this week",
     "total_volume_label": "Total lifted this week",
     "volume_overlap_note": "Muscle figures overlap — a bench press counts toward chest, shoulders and triceps, so they add up to more than the total.",
-    "no_volume_yet": "Log some sets with weights to see your muscle volume breakdown.",
+    "no_volume_yet": "Nothing logged this week yet. Enter a few sets with weights on the Today page and this fills in.",
     # --- export ---
     "export_header": "📤 Export Data", "export_caption": "Download your logs as CSV.",
     "download_daily": "⬇ Daily log", "download_sets": "⬇ Training sets",
@@ -3620,6 +3620,76 @@ def render_account_box():
                   on_click=st.logout)
 
 
+
+# ---------------------------------------------------------------
+# FIRST RUN
+# ---------------------------------------------------------------
+def has_any_data():
+    """Has this account logged anything real yet?
+
+    Deliberately cheap: two LIMIT 1 queries rather than counting rows, because
+    this runs on every Home render forever, not just for new accounts.
+    """
+    uid = current_user_id()
+    cols, rows = fetch("SELECT 1 FROM exercise_sets WHERE user_id=%s LIMIT 1", (uid,))
+    if rows:
+        return True
+    cols, rows = fetch("""SELECT 1 FROM daily_log WHERE user_id=%s
+                          AND (steps > 0 OR protein_g > 0 OR water_l > 0
+                               OR weight_kg IS NOT NULL) LIMIT 1""", (uid,))
+    return bool(rows)
+
+
+def render_getting_started():
+    """Three steps for a brand new account, each ticking itself off.
+
+    An empty screen is an invitation to act, so this replaces the empty charts
+    rather than sitting alongside them. It disappears for good once there's a
+    single logged set.
+    """
+    profile = get_profile()
+    profile_done = bool(profile.get("height_cm") and profile.get("weight_kg")
+                        and profile.get("age"))
+    cols, plan_rows = fetch("SELECT 1 FROM workout_plan WHERE user_id=%s LIMIT 1",
+                            (current_user_id(),))
+    plan_done = bool(plan_rows)
+
+    steps = [
+        ("Set up your profile", profile_done,
+         "Height, weight, age and goal. Momentum works out your calorie, "
+         "protein, water and step targets from these — you can override any of "
+         "them afterwards.", "Profile"),
+        ("Check your workout plan", plan_done,
+         "A default push/pull/legs split is already loaded. Edit it to match "
+         "what you actually train.", "Workout Plan"),
+        ("Log your first session", False,
+         "Open Today, tick off an exercise and enter your sets. Everything else "
+         "on this page builds from there.", "Today"),
+    ]
+
+    st.markdown("#### Getting started")
+    for i, (title, done, blurb, where) in enumerate(steps, start=1):
+        mark = "✓" if done else str(i)
+        colour = "#29A36A" if done else "#E8112D"
+        opacity = "0.5" if done else "1"
+        st.markdown(
+            f"<div style='display:flex;gap:12px;padding:11px 0;opacity:{opacity};"
+            f"border-bottom:1px solid #232B39;'>"
+            f"<div style='flex:none;width:22px;height:22px;border-radius:50%;"
+            f"border:1.5px solid {colour};color:{colour};font-size:0.72rem;"
+            f"font-weight:700;display:flex;align-items:center;"
+            f"justify-content:center;font-family:\"JetBrains Mono\",monospace;'>"
+            f"{mark}</div>"
+            f"<div><div style='font-weight:600;font-size:0.94rem;color:#E6EAF2;'>"
+            f"{title}</div>"
+            f"<div style='font-size:0.82rem;color:#7F8A9C;margin-top:2px;"
+            f"line-height:1.45;'>{blurb}</div>"
+            f"<div style='font-size:0.7rem;color:#7F8A9C;margin-top:5px;'>"
+            f"Sidebar &rarr; <span style='color:#E8112D;font-weight:600;'>"
+            f"{where}</span></div></div></div>",
+            unsafe_allow_html=True)
+
+
 # ---------------------------------------------------------------
 # UI
 # ---------------------------------------------------------------
@@ -3783,6 +3853,58 @@ input[type="number"] {
 /* Keyboard focus stays visible — restyling must not remove it */
 *:focus-visible { outline: 2px solid var(--mo-accent) !important; outline-offset: 2px; }
 
+
+/* ============================================================
+   MOBILE — you use this standing up, holding a phone
+   ============================================================ */
+@media (max-width: 640px) {
+
+  /* iOS Safari zooms the whole page when you focus an input smaller than
+     16px, and doesn't zoom back out. At 16px it leaves the viewport alone.
+     This one rule is the difference between usable and infuriating. */
+  input, textarea, select,
+  .stNumberInput input, .stTextInput input {
+    font-size: 16px !important;
+  }
+
+  /* Fingertip-sized targets. 44px is Apple's minimum; Streamlit's defaults
+     are sized for a mouse pointer. */
+  .stButton > button,
+  .stNumberInput button,
+  [data-baseweb="checkbox"] {
+    min-height: 44px !important;
+  }
+  .stNumberInput button { min-width: 44px !important; }
+  [data-testid="stCheckbox"] label { padding: 6px 0 !important; }
+
+  /* Claw back horizontal space — the default gutters cost a fifth of a
+     phone screen. */
+  .block-container {
+    padding-left: 0.85rem !important;
+    padding-right: 0.85rem !important;
+    padding-top: 2.6rem !important;
+  }
+
+  /* Vertical space is the scarce resource: the fewer finished exercises you
+     scroll past, the sooner you reach the one you're on. */
+  [data-testid="stExpander"] { margin-bottom: 6px !important; }
+  [data-testid="stMetric"] { padding: 8px 10px 6px 11px !important; }
+  [data-testid="stMetricValue"] { font-size: 1.2rem !important; }
+  h1 { font-size: 1.45rem !important; }
+  h2 { font-size: 1.15rem !important; }
+
+  /* Streamlit shrinks columns rather than stacking them, so three metrics
+     become three unreadable slivers. Force them full width. */
+  [data-testid="stHorizontalBlock"] { flex-wrap: wrap !important; }
+  [data-testid="column"] { min-width: 46% !important; }
+
+  /* The Gym Bro bubble sits over the save button at phone width. */
+  div.st-key-gym_bro_float { bottom: 16px !important; right: 16px !important; }
+  div.st-key-gym_bro_float > div > div > button {
+    width: 54px !important; height: 54px !important; min-width: 54px !important;
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
   * { animation: none !important; transition: none !important; }
 }
@@ -3868,6 +3990,10 @@ if page == t("nav_home"):
         unsafe_allow_html=True)
 
     st.markdown("---")
+
+    if not has_any_data():
+        render_getting_started()
+        st.stop()
 
     # --- Weekly muscle volume: the most distinctive thing on this page, so it
     # --- leads rather than sitting below four rows of metric cards.
@@ -4017,214 +4143,229 @@ elif page == t("nav_today"):
                     + "&nbsp;&nbsp;·&nbsp;&nbsp;".join(peak_bits).replace("**", "")
                     + "</div>", unsafe_allow_html=True)
 
-            with st.expander(f"{t('exercise_info_label')} — {effective_name}", expanded=False):
-                info = find_exercise_info(effective_name)
+            # Everything below is scoped to a fragment: typing a rep count
+            # reruns only this block, not the whole page. The checkbox above
+            # is deliberately left OUTSIDE — ticking an exercise off has to
+            # update the bottle and the done-counter further up the page,
+            # and those need a full rerun.
+            #
+            # ex, effective_name and swap are bound as default arguments
+            # rather than closed over: a closure would capture the loop
+            # variable, so every fragment would end up pointing at the last
+            # exercise in the list.
+            @st.fragment
+            def _exercise_detail(ex=ex, effective_name=effective_name,
+                                 swap=swap, log_date_str=log_date_str):
+              with st.expander(f"{t('exercise_info_label')} — {effective_name}", expanded=False):
+                  info = find_exercise_info(effective_name)
 
-                if swap:
-                    st.caption(f"{t('swapped_from_label')}: {ex}")
-                    if st.button(t("revert_swap_label"), key=f"revert_{log_date_str}_{ex}"):
-                        remove_exercise_swap(log_date_str, ex)
-                        st.rerun()
+                  if swap:
+                      st.caption(f"{t('swapped_from_label')}: {ex}")
+                      if st.button(t("revert_swap_label"), key=f"revert_{log_date_str}_{ex}"):
+                          remove_exercise_swap(log_date_str, ex)
+                          st.rerun()
 
-                # ---------------- HOW THIS MOVEMENT IS LOGGED ----------------
-                pref = get_exercise_pref(effective_name)
-                type_keys = list(LOG_TYPES.keys())
-                chosen_type = st.selectbox(
-                    t("log_type_label"), type_keys,
-                    index=type_keys.index(pref["log_type"]) if pref["log_type"] in type_keys else 0,
-                    format_func=lambda k: LOG_TYPES[k],
-                    key=f"logtype_{log_date_str}_{effective_name}")
+                  # ---------------- HOW THIS MOVEMENT IS LOGGED ----------------
+                  pref = get_exercise_pref(effective_name)
+                  type_keys = list(LOG_TYPES.keys())
+                  chosen_type = st.selectbox(
+                      t("log_type_label"), type_keys,
+                      index=type_keys.index(pref["log_type"]) if pref["log_type"] in type_keys else 0,
+                      format_func=lambda k: LOG_TYPES[k],
+                      key=f"logtype_{log_date_str}_{effective_name}")
 
-                per_side = pref["per_side"]
-                if chosen_type == "weight_reps":
-                    per_side = st.checkbox(
-                        t("per_side_label"), value=pref["per_side"],
-                        help=t("per_side_help"),
-                        key=f"perside_{log_date_str}_{effective_name}")
+                  per_side = pref["per_side"]
+                  if chosen_type == "weight_reps":
+                      per_side = st.checkbox(
+                          t("per_side_label"), value=pref["per_side"],
+                          help=t("per_side_help"),
+                          key=f"perside_{log_date_str}_{effective_name}")
 
-                if (chosen_type, per_side) != (pref["log_type"], pref["per_side"]):
-                    set_exercise_pref(effective_name, chosen_type, per_side)
-                    st.rerun()
+                  if (chosen_type, per_side) != (pref["log_type"], pref["per_side"]):
+                      set_exercise_pref(effective_name, chosen_type, per_side)
+                      st.rerun()
 
-                # ---------------- THE SETS THEMSELVES ----------------
-                st.markdown(f"**{t('sets_header')}**")
-                sets = get_sets(log_date_str, effective_name)
-                if not sets:
-                    sets = [{"set_number": 1, "reps": 0, "weight_kg": 0.0,
-                             "duration_min": 0.0, "distance_km": 0.0}]
+                  # ---------------- THE SETS THEMSELVES ----------------
+                  st.markdown(f"**{t('sets_header')}**")
+                  sets = get_sets(log_date_str, effective_name)
+                  if not sets:
+                      sets = [{"set_number": 1, "reps": 0, "weight_kg": 0.0,
+                               "duration_min": 0.0, "distance_km": 0.0}]
 
-                for sset in sets:
-                    n = sset["set_number"]
-                    kbase = f"{log_date_str}_{effective_name}_{n}"
+                  for sset in sets:
+                      n = sset["set_number"]
+                      kbase = f"{log_date_str}_{effective_name}_{n}"
 
-                    if chosen_type == "duration":
-                        dc1, dc2, dc3 = st.columns([1, 2, 2])
-                        with dc1:
-                            st.markdown(
-                                f"<div style='padding-top:32px;color:#9aa5b1;font-size:0.8rem;'>"
-                                f"#{n}</div>", unsafe_allow_html=True)
-                        with dc2:
-                            dur = st.number_input(t("duration_label"), min_value=0.0, step=5.0,
-                                                  value=float(sset.get("duration_min") or 0),
-                                                  key=f"dur_{kbase}")
-                        with dc3:
-                            dist = st.number_input(t("distance_label"), min_value=0.0, step=0.1,
-                                                   value=float(sset.get("distance_km") or 0),
-                                                   key=f"dist_{kbase}")
-                        if (dur, dist) != (sset.get("duration_min"), sset.get("distance_km")):
-                            save_set(log_date_str, effective_name, n, 0, 0, dur, dist)
+                      if chosen_type == "duration":
+                          dc1, dc2, dc3 = st.columns([1, 2, 2])
+                          with dc1:
+                              st.markdown(
+                                  f"<div style='padding-top:32px;color:#9aa5b1;font-size:0.8rem;'>"
+                                  f"#{n}</div>", unsafe_allow_html=True)
+                          with dc2:
+                              dur = st.number_input(t("duration_label"), min_value=0.0, step=5.0,
+                                                    value=float(sset.get("duration_min") or 0),
+                                                    key=f"dur_{kbase}")
+                          with dc3:
+                              dist = st.number_input(t("distance_label"), min_value=0.0, step=0.1,
+                                                     value=float(sset.get("distance_km") or 0),
+                                                     key=f"dist_{kbase}")
+                          if (dur, dist) != (sset.get("duration_min"), sset.get("distance_km")):
+                              save_set(log_date_str, effective_name, n, 0, 0, dur, dist)
 
-                    elif chosen_type == "bodyweight":
-                        bc1, bc2 = st.columns([1, 4])
-                        with bc1:
-                            st.markdown(
-                                f"<div style='padding-top:32px;color:#9aa5b1;font-size:0.8rem;'>"
-                                f"{t('set_label')} {n}</div>", unsafe_allow_html=True)
-                        with bc2:
-                            r = st.number_input(t("reps_label"), min_value=0, step=1,
-                                                value=int(sset["reps"] or 0), key=f"r_{kbase}")
-                        if r != sset["reps"]:
-                            save_set(log_date_str, effective_name, n, r, 0)
+                      elif chosen_type == "bodyweight":
+                          bc1, bc2 = st.columns([1, 4])
+                          with bc1:
+                              st.markdown(
+                                  f"<div style='padding-top:32px;color:#9aa5b1;font-size:0.8rem;'>"
+                                  f"{t('set_label')} {n}</div>", unsafe_allow_html=True)
+                          with bc2:
+                              r = st.number_input(t("reps_label"), min_value=0, step=1,
+                                                  value=int(sset["reps"] or 0), key=f"r_{kbase}")
+                          if r != sset["reps"]:
+                              save_set(log_date_str, effective_name, n, r, 0)
 
-                    else:  # weight_reps
-                        sc1, sc2, sc3 = st.columns([1, 2, 2])
-                        with sc1:
-                            st.markdown(
-                                f"<div style='padding-top:32px;color:#9aa5b1;font-size:0.8rem;'>"
-                                f"{t('set_label')} {n}</div>", unsafe_allow_html=True)
-                        with sc2:
-                            w = st.number_input(
-                                t("weight_each_label") if per_side else t("weight_kg_label"),
-                                min_value=0.0, step=2.5,
-                                value=float(sset["weight_kg"] or 0), key=f"w_{kbase}")
-                        with sc3:
-                            r = st.number_input(t("reps_label"), min_value=0, step=1,
-                                                value=int(sset["reps"] or 0), key=f"r_{kbase}")
-                        if (w, r) != (sset["weight_kg"], sset["reps"]):
-                            save_set(log_date_str, effective_name, n, r, w)
-                        if per_side and w:
-                            st.caption(f"= {effective_load(w, True):g} kg total")
+                      else:  # weight_reps
+                          sc1, sc2, sc3 = st.columns([1, 2, 2])
+                          with sc1:
+                              st.markdown(
+                                  f"<div style='padding-top:32px;color:#9aa5b1;font-size:0.8rem;'>"
+                                  f"{t('set_label')} {n}</div>", unsafe_allow_html=True)
+                          with sc2:
+                              w = st.number_input(
+                                  t("weight_each_label") if per_side else t("weight_kg_label"),
+                                  min_value=0.0, step=2.5,
+                                  value=float(sset["weight_kg"] or 0), key=f"w_{kbase}")
+                          with sc3:
+                              r = st.number_input(t("reps_label"), min_value=0, step=1,
+                                                  value=int(sset["reps"] or 0), key=f"r_{kbase}")
+                          if (w, r) != (sset["weight_kg"], sset["reps"]):
+                              save_set(log_date_str, effective_name, n, r, w)
+                          if per_side and w:
+                              st.caption(f"= {effective_load(w, True):g} kg total")
 
-                ac1, ac2 = st.columns(2)
-                with ac1:
-                    if st.button(t("add_set"), key=f"addset_{log_date_str}_{effective_name}",
-                                 use_container_width=True):
-                        # If the only row on screen is the unsaved placeholder,
-                        # persist it first so the new set lands at 2, not 1.
-                        stored = get_sets(log_date_str, effective_name)
-                        if not stored:
-                            first = sets[0]
-                            save_set(log_date_str, effective_name, 1,
-                                     first.get("reps", 0), first.get("weight_kg", 0),
-                                     first.get("duration_min", 0), first.get("distance_km", 0))
-                        save_set(log_date_str, effective_name,
-                                 next_set_number(log_date_str, effective_name), 0, 0)
-                        st.rerun()
-                with ac2:
-                    if len(sets) > 1 and st.button(
-                            t("remove_set"), key=f"delset_{log_date_str}_{effective_name}",
-                            use_container_width=True):
-                        delete_last_set(log_date_str, effective_name)
-                        renumber_sets(log_date_str, effective_name)
-                        st.rerun()
+                  ac1, ac2 = st.columns(2)
+                  with ac1:
+                      if st.button(t("add_set"), key=f"addset_{log_date_str}_{effective_name}",
+                                   use_container_width=True):
+                          # If the only row on screen is the unsaved placeholder,
+                          # persist it first so the new set lands at 2, not 1.
+                          stored = get_sets(log_date_str, effective_name)
+                          if not stored:
+                              first = sets[0]
+                              save_set(log_date_str, effective_name, 1,
+                                       first.get("reps", 0), first.get("weight_kg", 0),
+                                       first.get("duration_min", 0), first.get("distance_km", 0))
+                          save_set(log_date_str, effective_name,
+                                   next_set_number(log_date_str, effective_name), 0, 0)
+                          st.rerun()
+                  with ac2:
+                      if len(sets) > 1 and st.button(
+                              t("remove_set"), key=f"delset_{log_date_str}_{effective_name}",
+                              use_container_width=True):
+                          delete_last_set(log_date_str, effective_name)
+                          renumber_sets(log_date_str, effective_name)
+                          st.rerun()
 
-                # ---------------- SESSION SUMMARY ----------------
-                if chosen_type == "duration":
-                    mins, km = get_session_duration(log_date_str, effective_name)
-                    if mins or km:
-                        ex_kcal, _ = estimate_exercise_calories(log_date_str, effective_name)
-                        d1, d2, d3 = st.columns(3)
-                        d1.metric(t("total_time_label"), f"{mins:g} min")
-                        d2.metric(t("total_distance_label"), f"{km:g} km")
-                        d3.metric(t("calories_burned_label"), f"~{ex_kcal:,.0f}")
-                else:
-                    vol = get_session_volume(log_date_str, effective_name)
-                    if vol > 0:
-                        today_sets = get_sets(log_date_str, effective_name)
-                        best = max((estimated_1rm(effective_load(x["weight_kg"], per_side), x["reps"])
-                                    for x in today_sets), default=0)
-                        today_top = max((effective_load(x["weight_kg"], per_side)
-                                         for x in today_sets), default=0)
-                        prior = get_best_ever(effective_name, before_date=log_date_str)
+                  # ---------------- SESSION SUMMARY ----------------
+                  if chosen_type == "duration":
+                      mins, km = get_session_duration(log_date_str, effective_name)
+                      if mins or km:
+                          ex_kcal, _ = estimate_exercise_calories(log_date_str, effective_name)
+                          d1, d2, d3 = st.columns(3)
+                          d1.metric(t("total_time_label"), f"{mins:g} min")
+                          d2.metric(t("total_distance_label"), f"{km:g} km")
+                          d3.metric(t("calories_burned_label"), f"~{ex_kcal:,.0f}")
+                  else:
+                      vol = get_session_volume(log_date_str, effective_name)
+                      if vol > 0:
+                          today_sets = get_sets(log_date_str, effective_name)
+                          best = max((estimated_1rm(effective_load(x["weight_kg"], per_side), x["reps"])
+                                      for x in today_sets), default=0)
+                          today_top = max((effective_load(x["weight_kg"], per_side)
+                                           for x in today_sets), default=0)
+                          prior = get_best_ever(effective_name, before_date=log_date_str)
 
-                        ex_kcal, ex_min = estimate_exercise_calories(
-                            log_date_str, effective_name)
-                        v1, v2, v3 = st.columns(3)
-                        v1.metric(t("session_volume_label"), f"{vol:,.0f} kg")
-                        if best > 0:
-                            delta = f"{best - prior['e1rm']:+.1f} kg" if prior else None
-                            v2.metric(t("e1rm_label"), f"{best:.1f} kg", delta=delta)
-                        v3.metric(t("calories_burned_label"), f"~{ex_kcal:,.0f}",
-                                  help=t("calorie_per_exercise_help").format(
-                                      mins=f"{ex_min:.0f}"))
+                          ex_kcal, ex_min = estimate_exercise_calories(
+                              log_date_str, effective_name)
+                          v1, v2, v3 = st.columns(3)
+                          v1.metric(t("session_volume_label"), f"{vol:,.0f} kg")
+                          if best > 0:
+                              delta = f"{best - prior['e1rm']:+.1f} kg" if prior else None
+                              v2.metric(t("e1rm_label"), f"{best:.1f} kg", delta=delta)
+                          v3.metric(t("calories_burned_label"), f"~{ex_kcal:,.0f}",
+                                    help=t("calorie_per_exercise_help").format(
+                                        mins=f"{ex_min:.0f}"))
 
-                        if prior and today_top > prior["top_weight"]:
-                            st.success(
-                                f"🎉 {t('new_pb_label')} {today_top:g} kg "
-                                f"(was {prior['top_weight']:g} kg)")
+                          if prior and today_top > prior["top_weight"]:
+                              st.success(
+                                  f"🎉 {t('new_pb_label')} {today_top:g} kg "
+                                  f"(was {prior['top_weight']:g} kg)")
 
-                note = st.text_input(
-                    t("exercise_note_label"), value=get_exercise_note(log_date_str, effective_name),
-                    key=f"exnote_{log_date_str}_{effective_name}")
-                if note != get_exercise_note(log_date_str, effective_name):
-                    set_exercise_note(log_date_str, effective_name, note)
+                  note = st.text_input(
+                      t("exercise_note_label"), value=get_exercise_note(log_date_str, effective_name),
+                      key=f"exnote_{log_date_str}_{effective_name}")
+                  if note != get_exercise_note(log_date_str, effective_name):
+                      set_exercise_note(log_date_str, effective_name, note)
 
-                st.markdown("---")
-                # ---------------- DEMO / FORM ----------------
-                if info:
-                    render_exercise_demo(info, effective_name)
-                else:
-                    st.caption(t("no_demo_for_swap") if swap else t("no_info_label"))
+                  st.markdown("---")
+                  # ---------------- DEMO / FORM ----------------
+                  if info:
+                      render_exercise_demo(info, effective_name)
+                  else:
+                      st.caption(t("no_demo_for_swap") if swap else t("no_info_label"))
 
-                st.markdown(f"**{t('swap_label')}**")
-                st.caption(t("swap_help"))
-                # Picking from the known list means the swapped exercise still
-                # gets its demo images, muscles and cues. Free text still works,
-                # and is matched fuzzily against the library.
-                # Filters are stacked, not in columns. Side-by-side columns get
-                # squeezed to ~40% width on a phone, which made the muscle
-                # dropdown nearly unusable.
-                muscle_opts = [t("swap_all_muscles")] + exercise_muscle_filters()
-                swap_muscle = st.selectbox(
-                    t("swap_muscle_label"), muscle_opts, index=0,
-                    key=f"swap_m_{log_date_str}_{ex}")
+                  st.markdown(f"**{t('swap_label')}**")
+                  st.caption(t("swap_help"))
+                  # Picking from the known list means the swapped exercise still
+                  # gets its demo images, muscles and cues. Free text still works,
+                  # and is matched fuzzily against the library.
+                  # Filters are stacked, not in columns. Side-by-side columns get
+                  # squeezed to ~40% width on a phone, which made the muscle
+                  # dropdown nearly unusable.
+                  muscle_opts = [t("swap_all_muscles")] + exercise_muscle_filters()
+                  swap_muscle = st.selectbox(
+                      t("swap_muscle_label"), muscle_opts, index=0,
+                      key=f"swap_m_{log_date_str}_{ex}")
 
-                swap_query = st.text_input(
-                    t("swap_search_label"), value="",
-                    placeholder=t("swap_search_placeholder"),
-                    key=f"swap_q_{log_date_str}_{ex}")
+                  swap_query = st.text_input(
+                      t("swap_search_label"), value="",
+                      placeholder=t("swap_search_placeholder"),
+                      key=f"swap_q_{log_date_str}_{ex}")
 
-                muscle_filter = None if swap_muscle == t("swap_all_muscles") else swap_muscle
-                matches = search_exercises(swap_query, muscle_filter)
+                  muscle_filter = None if swap_muscle == t("swap_all_muscles") else swap_muscle
+                  matches = search_exercises(swap_query, muscle_filter)
 
-                picked_swap = None
-                if matches:
-                    st.caption(f"**{len(matches)}** {t('swap_matches_suffix')}")
-                    # A radio list for short result sets: no dropdown to open, no
-                    # scrolling inside a tiny native picker on mobile.
-                    if len(matches) <= 12:
-                        picked_swap = st.radio(
-                            t("swap_label"), matches, index=0,
-                            label_visibility="collapsed",
-                            key=f"swap_radio_{log_date_str}_{ex}")
-                    else:
-                        picked_swap = st.selectbox(
-                            t("swap_label"), matches, index=0,
-                            label_visibility="collapsed",
-                            help=t("swap_narrow_help"),
-                            key=f"swap_pick_{log_date_str}_{ex}")
-                        st.caption(t("swap_narrow_hint"))
-                else:
-                    st.caption(t("swap_no_matches"))
+                  picked_swap = None
+                  if matches:
+                      st.caption(f"**{len(matches)}** {t('swap_matches_suffix')}")
+                      # A radio list for short result sets: no dropdown to open, no
+                      # scrolling inside a tiny native picker on mobile.
+                      if len(matches) <= 12:
+                          picked_swap = st.radio(
+                              t("swap_label"), matches, index=0,
+                              label_visibility="collapsed",
+                              key=f"swap_radio_{log_date_str}_{ex}")
+                      else:
+                          picked_swap = st.selectbox(
+                              t("swap_label"), matches, index=0,
+                              label_visibility="collapsed",
+                              help=t("swap_narrow_help"),
+                              key=f"swap_pick_{log_date_str}_{ex}")
+                          st.caption(t("swap_narrow_hint"))
+                  else:
+                      st.caption(t("swap_no_matches"))
 
-                if st.button(t("swap_confirm"), key=f"swap_btn_{log_date_str}_{ex}",
-                             type="primary", use_container_width=True):
-                    # A typed query that matched nothing is still honoured — you
-                    # might be logging something the library has never heard of.
-                    chosen_swap = picked_swap or swap_query.strip()
-                    if chosen_swap:
-                        set_exercise_swap(log_date_str, ex, chosen_swap)
-                        st.rerun()
+                  if st.button(t("swap_confirm"), key=f"swap_btn_{log_date_str}_{ex}",
+                               type="primary", use_container_width=True):
+                      # A typed query that matched nothing is still honoured — you
+                      # might be logging something the library has never heard of.
+                      chosen_swap = picked_swap or swap_query.strip()
+                      if chosen_swap:
+                          set_exercise_swap(log_date_str, ex, chosen_swap)
+                          st.rerun()
+
+            _exercise_detail()
 
         # ---- Extra exercises (anything beyond today's plan) ----
         st.markdown(f"##### {t('extra_exercises_header')}")
@@ -4696,7 +4837,7 @@ elif page == t("nav_achievements"):
         } for r in prs])
         st.dataframe(pr_df, hide_index=True, use_container_width=True)
     else:
-        st.info("Log some sets with weight on the Today page to start building lift records.")
+        st.info("No lift records yet. Log a set with a weight and reps on the Today page — your best estimated 1RM per exercise appears here.")
 
     st.markdown(f"#### {t('strength_trend_header')}")
     lifts = get_logged_exercise_names()
