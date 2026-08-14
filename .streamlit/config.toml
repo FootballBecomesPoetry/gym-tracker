@@ -1,14 +1,10 @@
-# Save this as .streamlit/config.toml (same folder as secrets.toml)
-# It makes Streamlit's own widgets match the blue/violet palette used by
-# Momentum's custom components, instead of clashing with it.
-
 [theme]
 base = "dark"
-primaryColor = "#3b82f6"
-backgroundColor = "#0e1117"
-secondaryBackgroundColor = "#161b26"
-textColor = "#e6edf3"
-font = "sans serif"
+primaryColor = "#E8112D"
+backgroundColor = "#0B0E14"
+secondaryBackgroundColor = "#141922"
+textColor = "#E6EAF2"
+font = "sans-serif"
 
 [client]
 toolbarMode = "minimal"
