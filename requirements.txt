@@ -3,3 +3,7 @@ pandas
 psycopg2-binary
 plotly
 requests
+google-genai
+streamlit>=1.42
+Authlib>=1.3.2
+tzdata
