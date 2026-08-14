@@ -3047,7 +3047,7 @@ def render_meal_stamp():
 
 def render_animated_number(value, suffix="kg", duration_ms=900):
     html = f"""
-    <div style="font-size:2rem; font-weight:700; color:#3b82f6;"
+    <div style="font-size:2rem; font-weight:700; color:#E8112D; font-family:monospace;"
          id="counter">0{suffix}</div>
     <script>
     let start = null; const target = {value}; const duration = {duration_ms};
@@ -3100,7 +3100,7 @@ def render_animated_bars(labels, values, max_value, value_suffix=""):
         <div class="bar-col" data-target="{pct_of_max}" style="display:flex;flex-direction:column;align-items:center;flex:1;">
           <div style="font-size:0.7rem;margin-bottom:4px;color:#e6edf3;font-weight:600;">{val:.0f}{value_suffix}</div>
           <div style="width:70%;height:120px;background:rgba(147,163,184,0.18);border-radius:4px;display:flex;align-items:flex-end;overflow:hidden;">
-            <div class="bar-fill" style="width:100%;height:0%;background:linear-gradient(180deg,#8b5cf6,#3b82f6);border-radius:4px 4px 0 0;transition:height 0.6s ease-out;"></div>
+            <div class="bar-fill" style="width:100%;height:0%;background:#E8112D;border-radius:4px 4px 0 0;transition:height 0.6s ease-out;"></div>
           </div>
           <div style="font-size:0.7rem;margin-top:4px;color:#9aa5b1;">{lab}</div>
         </div>
@@ -3175,8 +3175,8 @@ def render_timeline_visual(dates):
         dots += f"""
         <div style="display:flex; flex-direction:column; align-items:center; flex:1; min-width:60px;">
           <div style="width:14px;height:14px;border-radius:50%;
-                      background:linear-gradient(135deg,#8b5cf6,#3b82f6);
-                      box-shadow:0 0 0 3px rgba(59,130,246,0.22);"></div>
+                      background:#E8112D;
+                      box-shadow:0 0 0 3px rgba(232,17,45,0.20);"></div>
           <div style="font-size:0.65rem; margin-top:4px; text-align:center; color:#9aa5b1;">{d}</div>
         </div>
         """
@@ -3212,8 +3212,8 @@ def render_bottle(pct, message):
                      L25,65 C25,45 40,35 40,35 Z"/>
           </clipPath>
           <linearGradient id="bottleFill" x1="0" y1="1" x2="0" y2="0">
-            <stop offset="0%" stop-color="#3b82f6"/>
-            <stop offset="100%" stop-color="#8b5cf6"/>
+            <stop offset="0%" stop-color="#E8112D"/>
+            <stop offset="100%" stop-color="#E8112D"/>
           </linearGradient>
         </defs>
         <path d="M40,10 L70,10 L70,35 C70,35 85,45 85,65 L85,195
@@ -3226,7 +3226,7 @@ def render_bottle(pct, message):
         <rect x="42" y="2" width="26" height="12" rx="3" fill="rgba(147,163,184,0.55)"/>
       </svg>
       <div style="margin-top:8px; font-weight:700; font-size:1.05rem; text-align:center;
-                  color:#3b82f6;">{pct:.0f}%</div>
+                  color:#E8112D;">{pct:.0f}%</div>
       <div style="margin-top:2px; font-size:0.9rem; text-align:center; color:#9aa5b1;">{message}</div>
     </div>
     """
@@ -3247,24 +3247,45 @@ def get_bottle_message(pct):
         return t("bottle_0")
 
 def render_clock():
-    """Ticking date + time in APP_TIMEZONE.
+    """Which day am I logging to?
 
-    Runs entirely in the browser. Driving this from Python would mean a rerun
-    every second, and a Streamlit rerun re-executes the whole script — every
-    query on the page, once a second.
+    That question is the reason this exists — the app files a session under the
+    date in APP_TIMEZONE, and near midnight that can differ from the server's
+    idea of today. So the DATE is the headline and the time is a supporting
+    detail, which is the reverse of how a clock normally reads.
 
-    The zone is passed through from APP_TIMEZONE so this always agrees with
-    local_today(). If the clock reads 00:15 Thursday, Thursday is the date your
-    workout will be logged against.
+    Runs in the browser. Driving it from Python would mean a Streamlit rerun
+    every second, and a rerun re-executes every query on the page.
     """
     zone = APP_TIMEZONE if _APP_TZ is not None else "UTC"
+    city = zone.split("/")[-1].replace("_", " ")
     html = f"""
-    <div style="font-family:-apple-system,'Segoe UI',sans-serif;padding:2px 0 6px 0;">
-      <div id="mo-date" style="font-size:0.72rem;opacity:0.6;letter-spacing:0.02em;">
-        &nbsp;</div>
-      <div id="mo-time" style="font-size:1.35rem;font-weight:700;color:#3b82f6;
-                               font-variant-numeric:tabular-nums;line-height:1.2;">
-        --:--:--</div>
+    <style>
+    @import url('https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,700&family=Inter+Tight:wght@500;600&family=JetBrains+Mono:wght@500&display=swap');
+    .mo-clock {{ padding: 2px 0 10px 0; }}
+    .mo-eyebrow {{
+      font-family: 'Inter Tight', sans-serif; font-size: 0.6rem; font-weight: 600;
+      letter-spacing: 0.18em; text-transform: uppercase; color: #7F8A9C;
+      margin-bottom: 3px;
+    }}
+    .mo-date {{
+      font-family: 'Bricolage Grotesque', sans-serif; font-weight: 700;
+      font-size: 1.02rem; letter-spacing: -0.01em; color: #E6EAF2; line-height: 1.15;
+    }}
+    .mo-time {{
+      font-family: 'JetBrains Mono', monospace; font-variant-numeric: tabular-nums;
+      font-size: 0.72rem; font-weight: 500; color: #7F8A9C; margin-top: 3px;
+    }}
+    .mo-dot {{
+      display: inline-block; width: 4px; height: 4px; border-radius: 50%;
+      background: #E8112D; vertical-align: middle; margin-right: 6px;
+    }}
+    </style>
+    <div class="mo-clock">
+      <div class="mo-eyebrow">Logging to</div>
+      <div class="mo-date" id="mo-date">&nbsp;</div>
+      <div class="mo-time"><span class="mo-dot"></span><span id="mo-time">--:--:--</span>
+        &nbsp;{city}</div>
     </div>
     <script>
     (function() {{
@@ -3275,17 +3296,13 @@ def render_clock():
         const now = new Date();
         try {{
           timeEl.innerText = now.toLocaleTimeString('en-GB', {{
-            timeZone: zone, hour: '2-digit', minute: '2-digit', second: '2-digit'
-          }});
+            timeZone: zone, hour: '2-digit', minute: '2-digit', second: '2-digit' }});
           dateEl.innerText = now.toLocaleDateString('en-GB', {{
-            timeZone: zone, weekday: 'short', day: 'numeric', month: 'short'
-          }});
+            timeZone: zone, weekday: 'long', day: 'numeric', month: 'long' }});
         }} catch (e) {{
-          // Unknown zone in this browser — fall back to the device clock rather
-          // than leaving the dashes on screen.
           timeEl.innerText = now.toLocaleTimeString('en-GB');
           dateEl.innerText = now.toLocaleDateString('en-GB',
-            {{ weekday: 'short', day: 'numeric', month: 'short' }});
+            {{ weekday: 'long', day: 'numeric', month: 'long' }});
         }}
       }}
       tick();
@@ -3293,8 +3310,7 @@ def render_clock():
     }})();
     </script>
     """
-    components.html(html, height=58)
-
+    components.html(html, height=72)
 
 def render_exercise_demo(info, display_name):
     """Demo photos + target muscles + form cues for one exercise."""
@@ -3327,11 +3343,11 @@ def render_rest_timer(seconds, key_suffix):
     <style>
     .rt-wrap-{uid} {{ display:flex; align-items:center; gap:10px; padding:4px 0;
                       font-family: -apple-system, "Segoe UI", sans-serif; }}
-    .rt-time-{uid} {{ font-size:1.9rem; font-weight:800; color:#3b82f6;
+    .rt-time-{uid} {{ font-size:1.9rem; font-weight:800; color:#E8112D;
                       font-variant-numeric: tabular-nums; min-width:96px; }}
     .rt-bar-{uid} {{ flex:1; height:8px; background:rgba(147,163,184,0.25);
                      border-radius:4px; overflow:hidden; }}
-    .rt-fill-{uid} {{ height:100%; width:100%; background:linear-gradient(90deg,#3b82f6,#8b5cf6);
+    .rt-fill-{uid} {{ height:100%; width:100%; background:#E8112D;
                       border-radius:4px; transition:width 1s linear; }}
     .rt-done-{uid} {{ color:#10b981 !important; }}
     </style>
@@ -3609,6 +3625,174 @@ def render_account_box():
 # ---------------------------------------------------------------
 st.set_page_config(page_title="Momentum", page_icon="⚡", layout="centered")
 
+# ---------------------------------------------------------------
+# VISUAL IDENTITY
+# ---------------------------------------------------------------
+# Injected once per run, before any page renders. Streamlit's own widgets are
+# restyled here; the components.html blocks carry their own copy of the tokens
+# because each renders in a separate iframe that this stylesheet can't reach.
+MOMENTUM_CSS = """
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,700;12..96,800&family=Inter+Tight:wght@400;500;600&family=JetBrains+Mono:wght@400;500;700&display=swap');
+
+:root {
+  --mo-ink:      #0B0E14;
+  --mo-surface:  #141922;
+  --mo-line:     #232B39;
+  --mo-text:     #E6EAF2;
+  --mo-muted:    #7F8A9C;
+  --mo-accent:   #E8112D;   /* 25kg plate */
+  --mo-good:     #29A36A;
+}
+
+html, body, [class*="css"], .stApp {
+  font-family: 'Inter Tight', -apple-system, 'Segoe UI', sans-serif;
+}
+
+/* --- Headings: the display face, used with restraint --- */
+h1, h2, h3, h4 {
+  font-family: 'Bricolage Grotesque', 'Inter Tight', sans-serif !important;
+  font-weight: 800 !important;
+  letter-spacing: -0.02em !important;
+  color: var(--mo-text) !important;
+}
+h1 { font-size: 1.9rem !important; }
+h2 { font-size: 1.35rem !important; }
+h3 { font-size: 1.1rem !important; }
+h4 {
+  font-size: 0.74rem !important;
+  font-weight: 700 !important;
+  letter-spacing: 0.16em !important;
+  text-transform: uppercase;
+  color: var(--mo-muted) !important;
+}
+
+/* --- THE SIGNATURE: every figure in tabular monospace --- */
+[data-testid="stMetricValue"] {
+  font-family: 'JetBrains Mono', monospace !important;
+  font-variant-numeric: tabular-nums;
+  font-weight: 700 !important;
+  font-size: 1.45rem !important;
+  letter-spacing: -0.02em;
+  color: var(--mo-text) !important;
+}
+[data-testid="stMetricLabel"] {
+  font-size: 0.66rem !important;
+  letter-spacing: 0.13em !important;
+  text-transform: uppercase;
+  color: var(--mo-muted) !important;
+  font-weight: 600 !important;
+}
+[data-testid="stMetricDelta"] {
+  font-family: 'JetBrains Mono', monospace !important;
+  font-size: 0.78rem !important;
+}
+
+/* Metric cards: a hairline box with an accent rule down the left edge. The
+   rule is the only colour on the card, so it reads as a marker not decoration. */
+[data-testid="stMetric"] {
+  background: var(--mo-surface);
+  border: 1px solid var(--mo-line);
+  border-left: 2px solid var(--mo-accent);
+  border-radius: 3px;
+  padding: 10px 12px 8px 13px;
+}
+
+/* --- Buttons: flat, tight, no pill radius --- */
+.stButton > button {
+  font-family: 'Inter Tight', sans-serif !important;
+  font-weight: 600 !important;
+  border-radius: 3px !important;
+  border: 1px solid var(--mo-line) !important;
+  background: var(--mo-surface) !important;
+  color: var(--mo-text) !important;
+  transition: border-color 0.15s ease, background 0.15s ease;
+}
+.stButton > button:hover {
+  border-color: var(--mo-accent) !important;
+  background: #1A2029 !important;
+  color: var(--mo-text) !important;
+}
+.stButton > button[kind="primary"] {
+  background: var(--mo-accent) !important;
+  border-color: var(--mo-accent) !important;
+  color: #fff !important;
+}
+.stButton > button[kind="primary"]:hover {
+  background: #C60E26 !important;
+  border-color: #C60E26 !important;
+}
+
+/* --- Tabs: an underline, not a pill --- */
+.stTabs [data-baseweb="tab-list"] {
+  gap: 22px;
+  border-bottom: 1px solid var(--mo-line);
+}
+.stTabs [data-baseweb="tab"] {
+  font-weight: 600;
+  font-size: 0.86rem;
+  letter-spacing: 0.01em;
+  color: var(--mo-muted);
+  padding: 6px 0 10px 0;
+}
+.stTabs [aria-selected="true"] { color: var(--mo-text) !important; }
+.stTabs [data-baseweb="tab-highlight"] { background: var(--mo-accent) !important; }
+
+/* --- Inputs and expanders --- */
+[data-testid="stExpander"] {
+  border: 1px solid var(--mo-line) !important;
+  border-radius: 3px !important;
+  background: var(--mo-surface);
+}
+[data-testid="stExpander"] summary { font-weight: 600; font-size: 0.9rem; }
+input, textarea, [data-baseweb="select"] > div {
+  border-radius: 3px !important;
+  font-family: 'Inter Tight', sans-serif !important;
+}
+/* Numbers you type are data too */
+input[type="number"] {
+  font-family: 'JetBrains Mono', monospace !important;
+  font-variant-numeric: tabular-nums;
+  font-weight: 500 !important;
+}
+
+/* --- Progress bars ---
+   Deliberately unstyled. st.progress(text=...) renders its label as a SIBLING
+   of the bar track, so a `.stProgress > div > div` selector catches the label
+   as well and collapses it. Streamlit already paints the fill with
+   primaryColor from config.toml, which is the plate red, so there is nothing
+   to add here. */
+
+/* --- Sidebar: a quieter plane, separated by a hairline --- */
+[data-testid="stSidebar"] {
+  background: #090C12;
+  border-right: 1px solid var(--mo-line);
+}
+[data-testid="stSidebar"] .stRadio label { font-size: 0.9rem; font-weight: 500; }
+
+/* --- Tables read as data --- */
+[data-testid="stDataFrame"] { font-family: 'JetBrains Mono', monospace !important; }
+[data-testid="stDataFrame"] * { font-variant-numeric: tabular-nums; }
+
+/* --- Captions --- */
+[data-testid="stCaptionContainer"] { color: var(--mo-muted) !important; font-size: 0.78rem; }
+
+/* --- The app title: set as a wordmark, not a heading --- */
+.stApp h1:first-of-type { letter-spacing: -0.035em !important; }
+
+/* Keyboard focus stays visible — restyling must not remove it */
+*:focus-visible { outline: 2px solid var(--mo-accent) !important; outline-offset: 2px; }
+
+@media (prefers-reduced-motion: reduce) {
+  * { animation: none !important; transition: none !important; }
+}
+</style>
+"""
+
+st.markdown(MOMENTUM_CSS, unsafe_allow_html=True)
+
+
+
 # --- Who is using the app? ---------------------------------------------------
 # Resolved before anything reads the database. In stage 1 this only gates access;
 # from stage 3 onward CURRENT_USER_ID is what every query filters on.
@@ -3664,6 +3848,27 @@ if page == t("nav_home"):
     streak, longest, total_days = compute_streak_stats()
     score = compute_momentum_score(today_str, weekday, TARGETS)
 
+    # --- Quote + verse: the first thing you see, so it opens the page. ---
+    inspiration = get_daily_inspiration()
+    st.markdown(
+        f"<div style='padding:2px 0 14px 0;'>"
+        f"<div style='font-family:\"Inter Tight\",sans-serif;font-size:0.6rem;"
+        f"font-weight:600;letter-spacing:0.18em;text-transform:uppercase;"
+        f"color:#7F8A9C;margin-bottom:7px;'>Today</div>"
+        f"<div style='font-family:\"Bricolage Grotesque\",sans-serif;"
+        f"font-weight:700;font-size:1.12rem;line-height:1.32;color:#E6EAF2;"
+        f"letter-spacing:-0.01em;'>{inspiration['quote']}</div>"
+        f"<div style='border-left:2px solid #E8112D;padding:5px 0 5px 12px;"
+        f"margin:12px 0 0 0;'>"
+        f"<div style='font-size:0.9rem;font-style:italic;opacity:0.8;"
+        f"line-height:1.45;'>&ldquo;{inspiration['verse']}&rdquo;</div>"
+        f"<div style='font-family:\"JetBrains Mono\",monospace;font-size:0.68rem;"
+        f"opacity:0.55;margin-top:5px;letter-spacing:0.02em;'>"
+        f"{inspiration['ref']}</div></div></div>",
+        unsafe_allow_html=True)
+
+    st.markdown("---")
+
     # --- Weekly muscle volume: the most distinctive thing on this page, so it
     # --- leads rather than sitting below four rows of metric cards.
     st.markdown(f"#### {t('muscle_volume_header')}")
@@ -3707,21 +3912,7 @@ if page == t("nav_home"):
     else:
         st.caption(f"{t('next_badge_label')}: 🏅 All streak badges unlocked!")
 
-    st.markdown("---")
 
-    # --- Quote + verse, moved to the bottom: nice to have, not why you opened
-    # --- the app on a training day.
-    inspiration = get_daily_inspiration()
-    st.caption(t("quote_of_day_label"))
-    st.markdown(f"*{inspiration['quote']}*")
-    st.markdown(
-        f"<div style='border-left:3px solid #3b82f6;padding:6px 0 6px 12px;"
-        f"margin:8px 0 4px 0;'>"
-        f"<div style='font-size:0.92rem;font-style:italic;opacity:0.85;'>"
-        f"&ldquo;{inspiration['verse']}&rdquo;</div>"
-        f"<div style='font-size:0.76rem;opacity:0.6;margin-top:4px;'>"
-        f"{inspiration['ref']}</div></div>",
-        unsafe_allow_html=True)
 
 elif page == t("nav_today"):
     col1, col2, col3 = st.columns([1, 2, 1])
