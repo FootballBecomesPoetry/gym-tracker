@@ -2392,7 +2392,7 @@ Rules you always follow:
 # How many times Gemini may call tools before we stop and answer with what we have.
 # A normal question needs 1 round; a comparison might need 2-3. The cap exists so a
 # confused model can't loop forever burning quota.
-MAX_TOOL_ROUNDS = 5
+MAX_TOOL_ROUNDS = 3
 
 
 def get_gemini_api_key():
@@ -2718,8 +2718,46 @@ GYM_BRO_TOOLS = [{"functionDeclarations": [
 ]}]
 
 
-def _gemini_call(contents, system_prompt, tools=None, timeout=60):
-    """One REST call to Gemini. Retries with the header auth route on 401/403."""
+# Statuses where trying again is likely to succeed. 503 is Gemini saying the
+# model is momentarily overloaded; 429 is a rate limit; 5xx are Google-side
+# faults. Anything else — a bad key, a retired model, a malformed request —
+# will fail identically no matter how many times you ask.
+GEMINI_RETRY_STATUSES = (429, 500, 502, 503, 504)
+GEMINI_MAX_ATTEMPTS = 3
+
+# Latency controls.
+#
+# thinkingBudget 0 disables the model's internal reasoning pass. That pass is
+# genuinely useful for hard problems and a pure waste here — Gym Bro answers
+# questions about oats and rest intervals, and the reasoning was costing 15-30
+# seconds per call.
+#
+# maxOutputTokens caps generation time, which scales with length. 800 is several
+# paragraphs; the system prompt already asks for short answers.
+GEMINI_GENERATION_CONFIG = {
+    "thinkingConfig": {"thinkingBudget": 0},
+    "maxOutputTokens": 800,
+    "temperature": 0.7,
+}
+
+GEMINI_TIMEOUT_SECONDS = 30
+
+
+def _gemini_call(contents, system_prompt, tools=None,
+                 timeout=GEMINI_TIMEOUT_SECONDS):
+    """One logical REST call to Gemini, retried through transient failures.
+
+    Backoff is exponential with jitter. Exponential because hammering an
+    overloaded service at a fixed interval is part of what keeps it overloaded;
+    jittered because without it every client that failed at the same instant
+    retries at the same instant and collides again.
+
+    Returns the final response object. The caller handles non-200s as before —
+    by the time it sees one, retrying has already been tried.
+    """
+    import random
+    import time
+
     api_key = get_gemini_api_key()
     url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
            f"{GEMINI_MODEL}:generateContent")
@@ -2729,10 +2767,64 @@ def _gemini_call(contents, system_prompt, tools=None, timeout=60):
     }
     if tools:
         payload["tools"] = tools
-    resp = requests.post(url, params={"key": api_key}, json=payload, timeout=timeout)
-    if resp.status_code in (401, 403):
-        resp = requests.post(url, headers={"x-goog-api-key": api_key},
-                             json=payload, timeout=timeout)
+
+    # thinkingConfig is model-specific. If a future model rejects it we drop it
+    # for the rest of the session rather than failing outright — Gym Bro gets
+    # slower, but it keeps working.
+    if not st.session_state.get("_gemini_no_thinking_config"):
+        payload["generationConfig"] = dict(GEMINI_GENERATION_CONFIG)
+    else:
+        cfg = dict(GEMINI_GENERATION_CONFIG)
+        cfg.pop("thinkingConfig", None)
+        payload["generationConfig"] = cfg
+
+    last_error = None
+    for attempt in range(GEMINI_MAX_ATTEMPTS):
+        if attempt:
+            # 1s, 2s, 4s plus up to half a second of jitter.
+            delay = (2 ** (attempt - 1)) + random.uniform(0, 0.5)
+            if last_error is not None and hasattr(last_error, "headers"):
+                # Retry-After is the server telling you exactly how long to
+                # wait. Believe it over the local guess, within reason.
+                try:
+                    delay = min(max(delay, float(
+                        last_error.headers.get("Retry-After", 0))), 15)
+                except (TypeError, ValueError):
+                    pass
+            time.sleep(delay)
+
+        try:
+            resp = requests.post(url, params={"key": api_key},
+                                 json=payload, timeout=timeout)
+            if resp.status_code in (401, 403):
+                resp = requests.post(url, headers={"x-goog-api-key": api_key},
+                                     json=payload, timeout=timeout)
+        except Exception as e:
+            # Timeouts and dropped connections are worth another go — gym wifi
+            # is not a reliable network.
+            last_error = e
+            if attempt == GEMINI_MAX_ATTEMPTS - 1:
+                raise
+            continue
+
+        # A 400 that names the generation config almost always means this model
+        # doesn't accept thinkingConfig. Strip it and try once more.
+        if (resp.status_code == 400
+                and not st.session_state.get("_gemini_no_thinking_config")
+                and ("thinking" in resp.text.lower()
+                     or "generationconfig" in resp.text.lower())):
+            st.session_state["_gemini_no_thinking_config"] = True
+            cfg = dict(GEMINI_GENERATION_CONFIG)
+            cfg.pop("thinkingConfig", None)
+            payload["generationConfig"] = cfg
+            last_error = resp
+            continue
+
+        if resp.status_code in GEMINI_RETRY_STATUSES and attempt < GEMINI_MAX_ATTEMPTS - 1:
+            last_error = resp
+            continue
+        return resp
+
     return resp
 
 
@@ -2759,7 +2851,15 @@ def _gemini_error_message(resp):
             f"\n\nDetails: {resp.text[:200]}"
         )
     if resp.status_code == 429:
-        return "\u26a0\ufe0f Gemini rate limit hit (429). Give it a minute and try again."
+        return ("\u26a0\ufe0f Gemini rate limit hit (429), and it was still limited "
+                "after three attempts. The free tier allows a limited number of "
+                "requests per minute — wait a minute and ask again.")
+    if resp.status_code in (500, 502, 503, 504):
+        return ("\u26a0\ufe0f Gemini is overloaded right now (%d). This is Google's "
+                "capacity, not your key or this app — it usually clears within a "
+                "minute.\n\nAlready retried three times with increasing waits. "
+                "Everything else in Momentum works normally in the meantime."
+                % resp.status_code)
     if resp.status_code == 400:
         return ("\u26a0\ufe0f Gemini rejected the request (400). Often a malformed tool "
                 f"declaration or an unavailable model.\n\nDetails: {resp.text[:300]}")
@@ -2926,7 +3026,7 @@ def render_gym_bro_widget():
             if send and user_input.strip():
                 st.session_state.gym_bro_messages.append(("user", user_input.strip()))
                 profile = get_profile()
-                with st.spinner("Thinking..."):
+                with st.spinner("Checking your log…"):
                     reply = ask_gym_bro(
                         user_input.strip(), st.session_state.gym_bro_messages[:-1], profile, TARGETS)
                 if reply is None:
