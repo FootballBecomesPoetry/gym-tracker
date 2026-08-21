@@ -1,4 +1,5 @@
 import re
+import time
 import requests
 import streamlit as st
 import streamlit.components.v1 as components
@@ -660,6 +661,9 @@ BASE_EN = {
     # --- sets / reps / weight logging ---
     "sets_header": "Sets", "set_label": "Set", "reps_label": "Reps",
     "weight_kg_label": "kg", "add_set": "➕ Add set", "remove_set": "➖ Remove last set",
+    "db_reconnect_error": "Couldn't reach the database just then — the connection had gone "
+                          "idle. It's been reset, so tap Add set again and it should work. "
+                          "({err})",
     "last_time_label": "Last time", "best_ever_label": "Best ever",
     "last_peak_label": "Last session peak",
     "new_pb_label": "New personal best —", "no_history_label": "No history yet for this lift",
@@ -685,6 +689,12 @@ BASE_EN = {
                      "means 44kg total load. Enter the weight of ONE dumbbell.",
     "weight_each_label": "kg (each)",
     "duration_label": "Minutes", "distance_label": "Distance (km)",
+    "incline_label": "Incline %",
+    "incline_help": "Treadmill incline setting. On most gym treadmills the number "
+                    "shown IS the percent grade, so incline 8 = 8. Leave at 0 for flat.",
+    "cardio_method_note": "Cardio uses the ACSM metabolic equations: speed is worked out "
+                          "from your distance and time, and incline is applied as a real "
+                          "gradient — so pace and steepness both change the result.",
     "total_time_label": "Total time", "total_distance_label": "Distance",
     # --- rest timer ---
     "rest_timer_label": "⏱ Rest timer", "start_timer": "Start",
@@ -1053,7 +1063,8 @@ def get_conn():
         PRIMARY KEY (log_date, exercise, set_number))""")
     # Cardio/walks are time-and-distance, not weight-and-reps. Added as separate
     # columns so existing rows are untouched.
-    for _col, _type in (("duration_min", "REAL"), ("distance_km", "REAL")):
+    for _col, _type in (("duration_min", "REAL"), ("distance_km", "REAL"),
+                        ("incline_pct", "REAL")):
         try:
             cur.execute(f"ALTER TABLE exercise_sets ADD COLUMN IF NOT EXISTS {_col} {_type} DEFAULT 0")
         except Exception:
@@ -1087,47 +1098,69 @@ def get_conn():
     cur.close()
     return conn
 
-def get_live_conn():
-    """Returns the cached connection, transparently reconnecting if Supabase closed it (e.g. idle timeout)."""
+def get_live_conn(ping=False):
+    """Cached connection, reconnecting if Supabase closed it (e.g. idle timeout).
+
+    `closed` alone is not enough: after the pooler drops an idle connection the
+    object still reports closed == 0, and the failure only surfaces on the next
+    query. When `ping` is set we send a cheap `SELECT 1` first and reconnect if
+    it fails, which is what makes the first action after a long idle work.
+    """
     c = get_conn()
     if c.closed:
         get_conn.clear()
-        c = get_conn()
+        return get_conn()
+    if ping:
+        try:
+            cur = c.cursor()
+            cur.execute("SELECT 1")
+            cur.close()
+        except Exception:
+            get_conn.clear()
+            c = get_conn()
     return c
+
+
+# psycopg2 raises a range of errors for a dropped connection depending on where
+# it died, so retry on the general DatabaseError rather than guessing subclasses.
+_RETRYABLE_DB_ERRORS = (psycopg2.InterfaceError, psycopg2.OperationalError,
+                        psycopg2.DatabaseError)
+
+
+def _db_execute(query, params=(), want_rows=False, attempts=3):
+    """Run a statement, reconnecting and retrying if the connection went stale.
+
+    Retries more than once because after a long idle the first attempt fails,
+    the reconnect happens, and only then can the statement actually run.
+    """
+    last_error = None
+    for attempt in range(attempts):
+        try:
+            c = get_live_conn(ping=(attempt > 0))
+            cur = c.cursor()
+            cur.execute(query, params)
+            if want_rows:
+                cols = [d[0] for d in cur.description]
+                rows = cur.fetchall()
+                cur.close()
+                return cols, rows
+            cur.close()
+            return None
+        except _RETRYABLE_DB_ERRORS as e:
+            last_error = e
+            get_conn.clear()
+            if attempt < attempts - 1:
+                time.sleep(0.4 * (attempt + 1))
+    raise last_error
+
 
 conn = get_live_conn()
 
 def run(query, params=()):
-    c = get_live_conn()
-    try:
-        cur = c.cursor()
-        cur.execute(query, params)
-        cur.close()
-    except (psycopg2.InterfaceError, psycopg2.OperationalError):
-        get_conn.clear()
-        c = get_live_conn()
-        cur = c.cursor()
-        cur.execute(query, params)
-        cur.close()
+    _db_execute(query, params, want_rows=False)
 
 def fetch(query, params=()):
-    c = get_live_conn()
-    try:
-        cur = c.cursor()
-        cur.execute(query, params)
-        cols = [d[0] for d in cur.description]
-        rows = cur.fetchall()
-        cur.close()
-        return cols, rows
-    except (psycopg2.InterfaceError, psycopg2.OperationalError):
-        get_conn.clear()
-        c = get_live_conn()
-        cur = c.cursor()
-        cur.execute(query, params)
-        cols = [d[0] for d in cur.description]
-        rows = cur.fetchall()
-        cur.close()
-        return cols, rows
+    return _db_execute(query, params, want_rows=True)
 
 # ---------------------------------------------------------------
 # CURRENT USER
@@ -1513,25 +1546,30 @@ def reset_plan_day(weekday):
 def get_sets(log_date, exercise):
     """Ordered list of sets, including duration/distance for cardio-style entries."""
     cols, rows = fetch("""SELECT set_number, reps, weight_kg,
-                                 COALESCE(duration_min,0), COALESCE(distance_km,0)
+                                 COALESCE(duration_min,0), COALESCE(distance_km,0),
+                                 COALESCE(incline_pct,0)
                           FROM exercise_sets
                           WHERE user_id=%s AND log_date=%s AND exercise=%s
                           ORDER BY set_number""",
                        (current_user_id(), log_date, exercise))
     return [{"set_number": r[0], "reps": r[1] or 0, "weight_kg": r[2] or 0.0,
-             "duration_min": r[3] or 0.0, "distance_km": r[4] or 0.0} for r in rows]
+             "duration_min": r[3] or 0.0, "distance_km": r[4] or 0.0,
+             "incline_pct": r[5] or 0.0} for r in rows]
 
 
 def save_set(log_date, exercise, set_number, reps, weight_kg,
-             duration_min=0, distance_km=0):
+             duration_min=0, distance_km=0, incline_pct=0):
     run("""INSERT INTO exercise_sets
-             (user_id, log_date, exercise, set_number, reps, weight_kg, duration_min, distance_km)
-           VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+             (user_id, log_date, exercise, set_number, reps, weight_kg, duration_min,
+              distance_km, incline_pct)
+           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
            ON CONFLICT (user_id, log_date, exercise, set_number) DO UPDATE SET
            reps=excluded.reps, weight_kg=excluded.weight_kg,
-           duration_min=excluded.duration_min, distance_km=excluded.distance_km""",
+           duration_min=excluded.duration_min, distance_km=excluded.distance_km,
+           incline_pct=excluded.incline_pct""",
         (current_user_id(), log_date, exercise, set_number, int(reps or 0),
-         float(weight_kg or 0), float(duration_min or 0), float(distance_km or 0)))
+         float(weight_kg or 0), float(duration_min or 0), float(distance_km or 0),
+         float(incline_pct or 0)))
 
 
 # ---------------------------------------------------------------
@@ -2137,9 +2175,28 @@ def get_daily_quote():
 
 MET_RESISTANCE_LIGHT = 3.5
 MET_RESISTANCE_VIGOROUS = 6.0
-MET_WALKING_MODERATE = 3.5
-MET_WALKING_INCLINE = 6.0
-MET_RUNNING = 9.0
+
+# Cardio no longer uses fixed MET values. Guessing a MET from the exercise NAME
+# was badly wrong: a run logged under a name without "run" in it scored the
+# walking value, and distance and incline were ignored entirely, so a 20-minute
+# walk always returned the same number no matter how fast or steep it was.
+#
+# Instead we use the ACSM metabolic equations, which take speed and gradient
+# directly and are the standard basis for treadmill energy expenditure:
+#
+#   walking (approx 3-6 km/h):  VO2 = 0.1*S + 1.8*S*G + 3.5
+#   running (above ~7 km/h):    VO2 = 0.2*S + 0.9*S*G + 3.5
+#
+# where S is speed in metres/minute, G is the fractional grade (8% -> 0.08) and
+# VO2 is ml/kg/min. Energy follows from ~5 kcal per litre of oxygen consumed:
+#
+#   kcal/min = VO2 * bodyweight_kg / 1000 * 5
+#
+# Speed is derived from the distance and time you log, so both now genuinely
+# affect the result, and incline is an input rather than a guess from the name.
+WALK_RUN_THRESHOLD_KMH = 7.0   # above this, the running equation applies
+KCAL_PER_LITRE_O2 = 5.0
+MET_CARDIO_FALLBACK = 4.5      # used only when no distance was logged
 
 # Assumed seconds per rep and rest between sets, used to turn a set count into
 # a session duration when you haven't logged actual time.
@@ -2160,6 +2217,45 @@ def _bodyweight_kg(default=75.0):
     return default
 
 
+def cardio_speed_kmh(distance_km, minutes):
+    """Average speed. Returns 0 when distance wasn't logged."""
+    if not distance_km or minutes <= 0:
+        return 0.0
+    return (distance_km / minutes) * 60.0
+
+
+def cardio_kcal(minutes, distance_km, incline_pct, bodyweight_kg, exercise_name=""):
+    """Energy cost of one cardio entry via the ACSM metabolic equations.
+
+    Speed comes from the distance and time you logged, and incline is applied as
+    a real gradient term, so a steeper or faster session genuinely scores higher.
+    Falls back to a generic MET value only when no distance is available.
+    """
+    if minutes <= 0:
+        return 0.0
+
+    speed_kmh = cardio_speed_kmh(distance_km, minutes)
+    if speed_kmh <= 0:
+        # No distance logged — nothing better than a broad average.
+        return MET_CARDIO_FALLBACK * bodyweight_kg * (minutes / 60.0)
+
+    speed_m_min = speed_kmh * 1000.0 / 60.0
+    grade = max(incline_pct, 0.0) / 100.0
+
+    name = (exercise_name or "").lower()
+    running = speed_kmh >= WALK_RUN_THRESHOLD_KMH or "run" in name or "sprint" in name
+
+    if running:
+        # Running: the grade term is smaller because the flight phase means less
+        # work is done directly against the slope.
+        vo2 = 0.2 * speed_m_min + 0.9 * speed_m_min * grade + 3.5
+    else:
+        vo2 = 0.1 * speed_m_min + 1.8 * speed_m_min * grade + 3.5
+
+    kcal_per_min = vo2 * bodyweight_kg / 1000.0 * KCAL_PER_LITRE_O2
+    return kcal_per_min * minutes
+
+
 def estimate_exercise_calories(log_date, exercise, bodyweight_kg=None):
     """Rough kcal for one exercise on one day.
 
@@ -2174,17 +2270,21 @@ def estimate_exercise_calories(log_date, exercise, bodyweight_kg=None):
     if not sets:
         return 0.0, 0.0
 
-    # ---- time-based (walks, cardio) ----
+    # ---- time-based (walks, runs, cardio) ----
     logged_minutes = sum(float(x.get("duration_min") or 0) for x in sets)
     if logged_minutes > 0:
-        name = exercise.lower()
-        if "run" in name or "sprint" in name:
-            met = MET_RUNNING
-        elif "incline" in name or "hill" in name:
-            met = MET_WALKING_INCLINE
-        else:
-            met = MET_WALKING_MODERATE
-        return met * bodyweight_kg * (logged_minutes / 60.0), logged_minutes
+        total_kcal = 0.0
+        for entry in sets:
+            mins = float(entry.get("duration_min") or 0)
+            if mins <= 0:
+                continue
+            total_kcal += cardio_kcal(
+                minutes=mins,
+                distance_km=float(entry.get("distance_km") or 0),
+                incline_pct=float(entry.get("incline_pct") or 0),
+                bodyweight_kg=bodyweight_kg,
+                exercise_name=exercise)
+        return total_kcal, logged_minutes
 
     # ---- lifting ----
     per_side = get_exercise_pref(exercise)["per_side"]
@@ -2361,6 +2461,8 @@ def format_set_summary(sets, per_side=False):
 # flash model. Pinning an exact version (e.g. gemini-2.5-flash) means the app
 # breaks with a 404 the day Google retires it — which is what happened before.
 GEMINI_MODEL = "gemini-flash-latest"
+# Used only when the main model returns 429/5xx repeatedly. Lighter, less contended.
+GEMINI_FALLBACK_MODEL = "gemini-flash-lite-latest"
 
 GYM_BRO_SYSTEM_PROMPT = """You are "Gym Bro" — a friendly, knowledgeable fitness buddy inside the Momentum app.
 
@@ -2392,7 +2494,7 @@ Rules you always follow:
 # How many times Gemini may call tools before we stop and answer with what we have.
 # A normal question needs 1 round; a comparison might need 2-3. The cap exists so a
 # confused model can't loop forever burning quota.
-MAX_TOOL_ROUNDS = 3
+MAX_TOOL_ROUNDS = 5
 
 
 def get_gemini_api_key():
@@ -2718,46 +2820,8 @@ GYM_BRO_TOOLS = [{"functionDeclarations": [
 ]}]
 
 
-# Statuses where trying again is likely to succeed. 503 is Gemini saying the
-# model is momentarily overloaded; 429 is a rate limit; 5xx are Google-side
-# faults. Anything else — a bad key, a retired model, a malformed request —
-# will fail identically no matter how many times you ask.
-GEMINI_RETRY_STATUSES = (429, 500, 502, 503, 504)
-GEMINI_MAX_ATTEMPTS = 3
-
-# Latency controls.
-#
-# thinkingBudget 0 disables the model's internal reasoning pass. That pass is
-# genuinely useful for hard problems and a pure waste here — Gym Bro answers
-# questions about oats and rest intervals, and the reasoning was costing 15-30
-# seconds per call.
-#
-# maxOutputTokens caps generation time, which scales with length. 800 is several
-# paragraphs; the system prompt already asks for short answers.
-GEMINI_GENERATION_CONFIG = {
-    "thinkingConfig": {"thinkingBudget": 0},
-    "maxOutputTokens": 800,
-    "temperature": 0.7,
-}
-
-GEMINI_TIMEOUT_SECONDS = 30
-
-
-def _gemini_call(contents, system_prompt, tools=None,
-                 timeout=GEMINI_TIMEOUT_SECONDS):
-    """One logical REST call to Gemini, retried through transient failures.
-
-    Backoff is exponential with jitter. Exponential because hammering an
-    overloaded service at a fixed interval is part of what keeps it overloaded;
-    jittered because without it every client that failed at the same instant
-    retries at the same instant and collides again.
-
-    Returns the final response object. The caller handles non-200s as before —
-    by the time it sees one, retrying has already been tried.
-    """
-    import random
-    import time
-
+def _gemini_call(contents, system_prompt, tools=None, timeout=60):
+    """One REST call to Gemini. Retries with the header auth route on 401/403."""
     api_key = get_gemini_api_key()
     url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
            f"{GEMINI_MODEL}:generateContent")
@@ -2768,62 +2832,32 @@ def _gemini_call(contents, system_prompt, tools=None,
     if tools:
         payload["tools"] = tools
 
-    # thinkingConfig is model-specific. If a future model rejects it we drop it
-    # for the rest of the session rather than failing outright — Gym Bro gets
-    # slower, but it keeps working.
-    if not st.session_state.get("_gemini_no_thinking_config"):
-        payload["generationConfig"] = dict(GEMINI_GENERATION_CONFIG)
-    else:
-        cfg = dict(GEMINI_GENERATION_CONFIG)
-        cfg.pop("thinkingConfig", None)
-        payload["generationConfig"] = cfg
-
-    last_error = None
-    for attempt in range(GEMINI_MAX_ATTEMPTS):
-        if attempt:
-            # 1s, 2s, 4s plus up to half a second of jitter.
-            delay = (2 ** (attempt - 1)) + random.uniform(0, 0.5)
-            if last_error is not None and hasattr(last_error, "headers"):
-                # Retry-After is the server telling you exactly how long to
-                # wait. Believe it over the local guess, within reason.
-                try:
-                    delay = min(max(delay, float(
-                        last_error.headers.get("Retry-After", 0))), 15)
-                except (TypeError, ValueError):
-                    pass
-            time.sleep(delay)
-
-        try:
-            resp = requests.post(url, params={"key": api_key},
+    def _post(target_url, use_header=False):
+        if use_header:
+            return requests.post(target_url, headers={"x-goog-api-key": api_key},
                                  json=payload, timeout=timeout)
-            if resp.status_code in (401, 403):
-                resp = requests.post(url, headers={"x-goog-api-key": api_key},
-                                     json=payload, timeout=timeout)
-        except Exception as e:
-            # Timeouts and dropped connections are worth another go — gym wifi
-            # is not a reliable network.
-            last_error = e
-            if attempt == GEMINI_MAX_ATTEMPTS - 1:
-                raise
-            continue
+        return requests.post(target_url, params={"key": api_key},
+                             json=payload, timeout=timeout)
 
-        # A 400 that names the generation config almost always means this model
-        # doesn't accept thinkingConfig. Strip it and try once more.
-        if (resp.status_code == 400
-                and not st.session_state.get("_gemini_no_thinking_config")
-                and ("thinking" in resp.text.lower()
-                     or "generationconfig" in resp.text.lower())):
-            st.session_state["_gemini_no_thinking_config"] = True
-            cfg = dict(GEMINI_GENERATION_CONFIG)
-            cfg.pop("thinkingConfig", None)
-            payload["generationConfig"] = cfg
-            last_error = resp
-            continue
+    resp = _post(url)
+    if resp.status_code in (401, 403):
+        resp = _post(url, use_header=True)
 
-        if resp.status_code in GEMINI_RETRY_STATUSES and attempt < GEMINI_MAX_ATTEMPTS - 1:
-            last_error = resp
-            continue
-        return resp
+    # 429/5xx mean Gemini is busy rather than misconfigured, and usually clear
+    # within a second or two. Retry with backoff before surfacing an error.
+    transient = (429, 500, 502, 503, 504)
+    for wait in (1.0, 2.5, 5.0):
+        if resp.status_code not in transient:
+            break
+        time.sleep(wait)
+        resp = _post(url)
+
+    # Still busy? Fall back to the lighter model, which is far less contended.
+    if resp.status_code in transient and GEMINI_FALLBACK_MODEL:
+        fallback_url = url.replace(f"{GEMINI_MODEL}:", f"{GEMINI_FALLBACK_MODEL}:")
+        fallback = _post(fallback_url)
+        if fallback.status_code == 200:
+            return fallback
 
     return resp
 
@@ -2851,15 +2885,13 @@ def _gemini_error_message(resp):
             f"\n\nDetails: {resp.text[:200]}"
         )
     if resp.status_code == 429:
-        return ("\u26a0\ufe0f Gemini rate limit hit (429), and it was still limited "
-                "after three attempts. The free tier allows a limited number of "
-                "requests per minute — wait a minute and ask again.")
+        return ("\u26a0\ufe0f Gemini rate limit reached (429) \u2014 either a burst of requests "
+                "or the free tier's daily quota. It resets on its own; try again shortly.")
     if resp.status_code in (500, 502, 503, 504):
-        return ("\u26a0\ufe0f Gemini is overloaded right now (%d). This is Google's "
-                "capacity, not your key or this app — it usually clears within a "
-                "minute.\n\nAlready retried three times with increasing waits. "
-                "Everything else in Momentum works normally in the meantime."
-                % resp.status_code)
+        return ("\u26a0\ufe0f Gemini's servers are busy (HTTP "
+                f"{resp.status_code}). This is Google's end, not your setup \u2014 your API key "
+                "is fine. Already retried a few times and tried the lighter model. "
+                "Give it a minute and ask again.")
     if resp.status_code == 400:
         return ("\u26a0\ufe0f Gemini rejected the request (400). Often a malformed tool "
                 f"declaration or an unavailable model.\n\nDetails: {resp.text[:300]}")
@@ -2991,7 +3023,7 @@ def render_gym_bro_widget():
         st.session_state.gym_bro_messages = []
 
     with st.container(key="gym_bro_float"):
-        with st.popover("🏋️", use_container_width=False):
+        with st.popover("🏋️", width="content"):
             st.markdown(f"**{t('gym_bro_header')}**")
             st.caption(t("gym_bro_intro"))
             st.caption(t("gym_bro_disclaimer"))
@@ -3016,7 +3048,7 @@ def render_gym_bro_widget():
                     t("gym_bro_placeholder"), key="gym_bro_text",
                     label_visibility="collapsed", placeholder=t("gym_bro_placeholder"))
             with gb2:
-                send = st.button("➤", key="gym_bro_send", use_container_width=True)
+                send = st.button("➤", key="gym_bro_send", width="stretch")
 
             if st.session_state.gym_bro_messages:
                 if st.button(t("gym_bro_clear"), key="gym_bro_clear_btn"):
@@ -3026,7 +3058,7 @@ def render_gym_bro_widget():
             if send and user_input.strip():
                 st.session_state.gym_bro_messages.append(("user", user_input.strip()))
                 profile = get_profile()
-                with st.spinner("Checking your log…"):
+                with st.spinner("Thinking..."):
                     reply = ask_gym_bro(
                         user_input.strip(), st.session_state.gym_bro_messages[:-1], profile, TARGETS)
                 if reply is None:
@@ -3425,7 +3457,7 @@ def render_exercise_demo(info, display_name):
             with c:
                 st.image(img_url,
                          caption=phase_labels[i] if i < len(phase_labels) else f"Step {i+1}",
-                         use_container_width=True)
+                         width="stretch")
     if info.get("muscles"):
         st.markdown(f"**{t('muscles_targeted_label')}:** " + ", ".join(info["muscles"]))
     if info.get("cues"):
@@ -3716,7 +3748,7 @@ def render_account_box():
     label = (getattr(user, "name", None) or getattr(user, "email", None) or "Signed in")
     st.caption(f"👤 {label}")
     if hasattr(st, "logout"):
-        st.button("Sign out", key="_logout_btn", use_container_width=True,
+        st.button("Sign out", key="_logout_btn", width="stretch",
                   on_click=st.logout)
 
 
@@ -4143,10 +4175,10 @@ if page == t("nav_home"):
 elif page == t("nav_today"):
     col1, col2, col3 = st.columns([1, 2, 1])
     with col1:
-        if st.button(t("prev_day"), use_container_width=True):
+        if st.button(t("prev_day"), width="stretch"):
             st.session_state.selected_date -= timedelta(days=1)
     with col3:
-        if st.button(t("next_day"), use_container_width=True):
+        if st.button(t("next_day"), width="stretch"):
             st.session_state.selected_date += timedelta(days=1)
     with col2:
         picked = st.date_input("Date", value=st.session_state.selected_date, label_visibility="collapsed")
@@ -4198,7 +4230,7 @@ elif page == t("nav_today"):
                 for secs, col in ((60, rt1), (90, rt2), (180, rt3)):
                     with col:
                         if st.button(f"{secs//60}:{secs%60:02d}", key=f"rt_{log_date_str}_{secs}",
-                                     use_container_width=True):
+                                     width="stretch"):
                             st.session_state["active_timer"] = secs
                 if st.session_state.get("active_timer"):
                     render_rest_timer(st.session_state["active_timer"],
@@ -4297,21 +4329,36 @@ elif page == t("nav_today"):
                       kbase = f"{log_date_str}_{effective_name}_{n}"
 
                       if chosen_type == "duration":
-                          dc1, dc2, dc3 = st.columns([1, 2, 2])
+                          dc1, dc2, dc3 = st.columns(3)
                           with dc1:
-                              st.markdown(
-                                  f"<div style='padding-top:32px;color:#9aa5b1;font-size:0.8rem;'>"
-                                  f"#{n}</div>", unsafe_allow_html=True)
-                          with dc2:
-                              dur = st.number_input(t("duration_label"), min_value=0.0, step=5.0,
+                              dur = st.number_input(t("duration_label"), min_value=0.0, step=1.0,
                                                     value=float(sset.get("duration_min") or 0),
                                                     key=f"dur_{kbase}")
-                          with dc3:
+                          with dc2:
                               dist = st.number_input(t("distance_label"), min_value=0.0, step=0.1,
                                                      value=float(sset.get("distance_km") or 0),
                                                      key=f"dist_{kbase}")
-                          if (dur, dist) != (sset.get("duration_min"), sset.get("distance_km")):
-                              save_set(log_date_str, effective_name, n, 0, 0, dur, dist)
+                          with dc3:
+                              incl = st.number_input(t("incline_label"), min_value=0.0,
+                                                     max_value=40.0, step=0.5,
+                                                     value=float(sset.get("incline_pct") or 0),
+                                                     help=t("incline_help"),
+                                                     key=f"incl_{kbase}")
+                          if (dur, dist, incl) != (sset.get("duration_min"),
+                                                   sset.get("distance_km"),
+                                                   sset.get("incline_pct")):
+                              save_set(log_date_str, effective_name, n, 0, 0, dur, dist, incl)
+
+                          # Show the pace this works out to, so a wrong distance
+                          # or time is obvious straight away.
+                          if dur > 0 and dist > 0:
+                              kmh = cardio_speed_kmh(dist, dur)
+                              pace_min = dur / dist
+                              st.caption(
+                                  f"{kmh:.1f} km/h · {int(pace_min)}:{int(round((pace_min%1)*60)):02d} /km"
+                                  + (f" · {incl:g}% incline" if incl else "")
+                                  + ("  ·  running pace" if kmh >= WALK_RUN_THRESHOLD_KMH
+                                     else "  ·  walking pace"))
 
                       elif chosen_type == "bodyweight":
                           bc1, bc2 = st.columns([1, 4])
@@ -4347,22 +4394,29 @@ elif page == t("nav_today"):
                   ac1, ac2 = st.columns(2)
                   with ac1:
                       if st.button(t("add_set"), key=f"addset_{log_date_str}_{effective_name}",
-                                   use_container_width=True):
-                          # If the only row on screen is the unsaved placeholder,
-                          # persist it first so the new set lands at 2, not 1.
-                          stored = get_sets(log_date_str, effective_name)
-                          if not stored:
-                              first = sets[0]
-                              save_set(log_date_str, effective_name, 1,
-                                       first.get("reps", 0), first.get("weight_kg", 0),
-                                       first.get("duration_min", 0), first.get("distance_km", 0))
-                          save_set(log_date_str, effective_name,
-                                   next_set_number(log_date_str, effective_name), 0, 0)
-                          st.rerun()
+                                   width="stretch"):
+                          # Wrapped so a dropped DB connection reports itself instead
+                          # of the button appearing to do nothing.
+                          try:
+                              # If the only row on screen is the unsaved placeholder,
+                              # persist it first so the new set lands at 2, not 1.
+                              stored = get_sets(log_date_str, effective_name)
+                              if not stored:
+                                  first = sets[0]
+                                  save_set(log_date_str, effective_name, 1,
+                                           first.get("reps", 0), first.get("weight_kg", 0),
+                                           first.get("duration_min", 0),
+                                           first.get("distance_km", 0),
+                                           first.get("incline_pct", 0))
+                              save_set(log_date_str, effective_name,
+                                       next_set_number(log_date_str, effective_name), 0, 0)
+                              st.rerun()
+                          except Exception as e:
+                              st.error(t("db_reconnect_error").format(err=str(e)[:120]))
                   with ac2:
                       if len(sets) > 1 and st.button(
                               t("remove_set"), key=f"delset_{log_date_str}_{effective_name}",
-                              use_container_width=True):
+                              width="stretch"):
                           delete_last_set(log_date_str, effective_name)
                           renumber_sets(log_date_str, effective_name)
                           st.rerun()
@@ -4457,7 +4511,7 @@ elif page == t("nav_today"):
                       st.caption(t("swap_no_matches"))
 
                   if st.button(t("swap_confirm"), key=f"swap_btn_{log_date_str}_{ex}",
-                               type="primary", use_container_width=True):
+                               type="primary", width="stretch"):
                       # A typed query that matched nothing is still honoured — you
                       # might be logging something the library has never heard of.
                       chosen_swap = picked_swap or swap_query.strip()
@@ -4495,7 +4549,7 @@ elif page == t("nav_today"):
                 label_visibility="collapsed", placeholder=t("add_extra_placeholder"))
         with new_extra_col2:
             if st.button(t("add_extra_button"), key=f"add_extra_btn_{log_date_str}",
-                         use_container_width=True):
+                         width="stretch"):
                 if new_extra_name.strip():
                     set_exercise_check(log_date_str, new_extra_name.strip(), True)
                     st.rerun()
@@ -4514,7 +4568,7 @@ elif page == t("nav_today"):
                     "Minutes": f"{b['minutes']:.0f}",
                     "kcal": f"{b['kcal']:,.0f}",
                 } for b in burn["breakdown"]])
-                st.dataframe(rows_df, hide_index=True, use_container_width=True)
+                st.dataframe(rows_df, hide_index=True, width="stretch")
                 st.metric(t("calories_burned_label"), f"~{burn['kcal']:,.0f} kcal")
                 st.warning(t("calorie_accuracy_warning"))
 
@@ -4599,7 +4653,7 @@ elif page == t("nav_today"):
                                  step=0.1, key=f"weight_{log_date_str}")
         notes = st.text_area(t("notes_label"), value=row["notes"] or "", key=f"notes_{log_date_str}")
 
-        if st.button(t("save_button"), type="primary", use_container_width=True):
+        if st.button(t("save_button"), type="primary", width="stretch"):
             save_daily_row(log_date_str, protein, water, steps,
                            weight if weight > 0 else None, notes)
             st.success(t("saved_msg"))
@@ -4655,7 +4709,7 @@ elif page == t("nav_weight_log"):
         c3.metric(t("entries_logged"), len(df))
         st.dataframe(df[["log_date", "weight_kg"]].rename(
             columns={"log_date": "Date", "weight_kg": t("weight_label")}
-        ).sort_values("Date", ascending=False), hide_index=True, use_container_width=True)
+        ).sort_values("Date", ascending=False), hide_index=True, width="stretch")
 
     st.markdown(f"#### {t('prediction_header')}")
     prediction = compute_weight_prediction()
@@ -4753,7 +4807,7 @@ elif page == t("nav_weekly_dashboard"):
         "steps": t("steps_label"), "weight_kg": t("weight_label"), "meals_done": "Meals done",
         "ex_done": "Exercises done", "ex_total": "Exercises total",
         "calories_total": "Calories", "meal_protein_total": "Protein (meals)"
-    }), hide_index=True, use_container_width=True)
+    }), hide_index=True, width="stretch")
 
     with st.expander(t("advanced_trends_header"), expanded=False):
         end30 = local_today()
@@ -4782,19 +4836,19 @@ elif page == t("nav_weekly_dashboard"):
             weight30 = weight30.sort_values("log_date")
             weight30["weight_roll7"] = weight30["weight_kg"].rolling(7, min_periods=1).mean()
             fig_w = px.line(weight30, x="log_date", y="weight_roll7", title="7-Day Rolling Avg — Weight (kg)")
-            st.plotly_chart(fig_w, use_container_width=True)
+            st.plotly_chart(fig_w, width="stretch")
 
         fig_cal = px.line(s30, x="log_date", y="calories_roll7", title="7-Day Rolling Avg — Calories")
-        st.plotly_chart(fig_cal, use_container_width=True)
+        st.plotly_chart(fig_cal, width="stretch")
 
         fig_prot = px.line(s30, x="log_date", y="protein_roll7", title="7-Day Rolling Avg — Protein (g)")
-        st.plotly_chart(fig_prot, use_container_width=True)
+        st.plotly_chart(fig_prot, width="stretch")
 
         fig_steps = px.line(s30, x="log_date", y="steps_roll7", title="7-Day Rolling Avg — Steps")
-        st.plotly_chart(fig_steps, use_container_width=True)
+        st.plotly_chart(fig_steps, width="stretch")
 
         fig_comp = px.line(s30, x="log_date", y="compliance_roll7", title="7-Day Rolling Avg — Workout Compliance %")
-        st.plotly_chart(fig_comp, use_container_width=True)
+        st.plotly_chart(fig_comp, width="stretch")
 
 elif page == t("nav_measurements"):
     st.subheader(t("measurements_header"))
@@ -4935,7 +4989,7 @@ elif page == t("nav_achievements"):
             "Est. 1RM": f"{r['e1rm']:.1f}kg",
             "Date": r["log_date"],
         } for r in prs])
-        st.dataframe(pr_df, hide_index=True, use_container_width=True)
+        st.dataframe(pr_df, hide_index=True, width="stretch")
     else:
         st.info("No lift records yet. Log a set with a weight and reps on the Today page — your best estimated 1RM per exercise appears here.")
 
@@ -4951,7 +5005,7 @@ elif page == t("nav_achievements"):
             fig_s = px.line(trend, x="log_date", y="e1rm", markers=True,
                             title=f"Estimated 1RM — {chosen}")
             fig_s.update_layout(yaxis_title="Est. 1RM (kg)", xaxis_title="")
-            st.plotly_chart(fig_s, use_container_width=True)
+            st.plotly_chart(fig_s, width="stretch")
 
             first, last = trend["e1rm"].iloc[0], trend["e1rm"].iloc[-1]
             peak = trend["e1rm"].max()
@@ -4965,7 +5019,7 @@ elif page == t("nav_achievements"):
             st.dataframe(
                 show.rename(columns={"log_date": "Date", "e1rm": "Est. 1RM (kg)",
                                      "top_weight": "Heaviest set (kg)"}),
-                hide_index=True, use_container_width=True)
+                hide_index=True, width="stretch")
 
         elif len(trend) == 1:
             # One session is still worth showing — previously this branch printed
@@ -4996,7 +5050,7 @@ elif page == t("nav_plan"):
             pc1, pc2 = st.columns(2)
             with pc1:
                 if st.button(t("save_plan"), key=f"plan_save_{weekday}",
-                             type="primary", use_container_width=True):
+                             type="primary", width="stretch"):
                     exercises = [line.strip() for line in ex_text.split("\n") if line.strip()]
                     if exercises:
                         save_plan_day(weekday, label.strip() or weekday, exercises)
@@ -5006,7 +5060,7 @@ elif page == t("nav_plan"):
                         st.warning("Add at least one exercise before saving.")
             with pc2:
                 if st.button(t("reset_plan"), key=f"plan_reset_{weekday}",
-                             use_container_width=True):
+                             width="stretch"):
                     reset_plan_day(weekday)
                     st.rerun()
 
@@ -5073,14 +5127,14 @@ elif page == t("nav_settings"):
         daily_all = get_range_df(date(2000, 1, 1), local_today())
         st.download_button(t("download_daily"), daily_all.to_csv(index=False).encode("utf-8"),
                            file_name="momentum_daily_log.csv", mime="text/csv",
-                           use_container_width=True)
+                           width="stretch")
     with e2:
         sets_all = get_all_sets_df()
         st.download_button(t("download_sets"), sets_all.to_csv(index=False).encode("utf-8"),
                            file_name="momentum_training_sets.csv", mime="text/csv",
-                           use_container_width=True)
+                           width="stretch")
     with e3:
         meas_all = get_all_measurements()
         st.download_button(t("download_measurements"), meas_all.to_csv(index=False).encode("utf-8"),
                            file_name="momentum_measurements.csv", mime="text/csv",
-                           use_container_width=True)
+                           width="stretch")
