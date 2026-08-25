@@ -2858,6 +2858,14 @@ def format_set_summary(sets, per_side=False):
 GEMINI_MODEL = "gemini-flash-latest"
 # Used only when the main model returns 429/5xx repeatedly. Lighter, less contended.
 GEMINI_FALLBACK_MODEL = "gemini-flash-lite-latest"
+# Per-request network timeout, and the most time retries may burn on ONE call.
+# Kept small deliberately: _gemini_call runs once per tool round, so anything
+# generous here multiplies by MAX_TOOL_ROUNDS.
+GEMINI_TIMEOUT_S = 25
+GEMINI_RETRY_BUDGET_S = 3.0
+# Whole-conversation ceiling. Once passed, we stop looping and answer with what
+# we have rather than leaving the user watching a spinner.
+GEMINI_TOTAL_BUDGET_S = 45
 
 GYM_BRO_SYSTEM_PROMPT = """You are "Gym Bro" — a friendly, knowledgeable fitness buddy inside the Momentum app.
 
@@ -3215,7 +3223,7 @@ GYM_BRO_TOOLS = [{"functionDeclarations": [
 ]}]
 
 
-def _gemini_call(contents, system_prompt, tools=None, timeout=60):
+def _gemini_call(contents, system_prompt, tools=None, timeout=GEMINI_TIMEOUT_S):
     """One REST call to Gemini. Retries with the header auth route on 401/403."""
     api_key = get_gemini_api_key()
     url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
@@ -3239,20 +3247,26 @@ def _gemini_call(contents, system_prompt, tools=None, timeout=60):
         resp = _post(url, use_header=True)
 
     # 429/5xx mean Gemini is busy rather than misconfigured, and usually clear
-    # within a second or two. Retry with backoff before surfacing an error.
+    # within a second. Retry briefly, but keep it tight: this runs inside the
+    # tool-calling loop, so a generous per-call backoff multiplies by the number
+    # of rounds and turns a slow answer into a minute of silence.
     transient = (429, 500, 502, 503, 504)
-    for wait in (1.0, 2.5, 5.0):
-        if resp.status_code not in transient:
+    deadline = time.monotonic() + GEMINI_RETRY_BUDGET_S
+    for wait in (0.6, 1.2):
+        if resp.status_code not in transient or time.monotonic() > deadline:
             break
         time.sleep(wait)
         resp = _post(url)
 
-    # Still busy? Fall back to the lighter model, which is far less contended.
+    # Still busy? One shot at the lighter model, which is far less contended.
     if resp.status_code in transient and GEMINI_FALLBACK_MODEL:
         fallback_url = url.replace(f"{GEMINI_MODEL}:", f"{GEMINI_FALLBACK_MODEL}:")
-        fallback = _post(fallback_url)
-        if fallback.status_code == 200:
-            return fallback
+        try:
+            fallback = _post(fallback_url)
+            if fallback.status_code == 200:
+                return fallback
+        except Exception:
+            pass
 
     return resp
 
@@ -3293,7 +3307,7 @@ def _gemini_error_message(resp):
     return f"\u26a0\ufe0f Gemini returned HTTP {resp.status_code}: {resp.text[:300]}"
 
 
-def ask_gym_bro(user_message, chat_history, profile, targets):
+def ask_gym_bro(user_message, chat_history, profile, targets, on_progress=None):
     """Answer a question, letting Gemini query the user's own logged data.
 
     Flow: send the question with the tool declarations attached. If the model
@@ -3325,10 +3339,18 @@ def ask_gym_bro(user_message, chat_history, profile, targets):
     contents.append({"role": "user", "parts": [{"text": user_message}]})
 
     tools_used = []
+    deadline = time.monotonic() + GEMINI_TOTAL_BUDGET_S
 
-    for _ in range(MAX_TOOL_ROUNDS):
+    for _round in range(MAX_TOOL_ROUNDS):
+        # Out of time: ask for a plain answer with no tools rather than starting
+        # another lookup round the user will sit through.
+        out_of_time = time.monotonic() > deadline
+        if on_progress:
+            on_progress("Checking your training data..." if _round
+                        else "Thinking...")
         try:
-            resp = _gemini_call(contents, system_prompt, tools=GYM_BRO_TOOLS)
+            resp = _gemini_call(contents, system_prompt,
+                                tools=None if out_of_time else GYM_BRO_TOOLS)
         except Exception as e:
             return f"\u26a0\ufe0f Couldn't reach Gemini: {e}"
 
@@ -3374,6 +3396,9 @@ def ask_gym_bro(user_message, chat_history, profile, targets):
             tool_parts.append({"functionResponse": {
                 "name": name, "response": _json_safe(result)}})
         contents.append({"role": "user", "parts": tool_parts})
+        if on_progress and tools_used:
+            on_progress("Looked up: " + ", ".join(
+                sorted(set(tools_used))[:3]).replace("_", " ") + "...")
 
     return ("\u26a0\ufe0f Gym Bro kept looking things up without settling on an answer "
             f"(tried: {', '.join(tools_used[:8])}). Try asking something narrower.")
@@ -3453,9 +3478,13 @@ def render_gym_bro_widget():
             if send and user_input.strip():
                 st.session_state.gym_bro_messages.append(("user", user_input.strip()))
                 profile = get_profile()
+                status_box = st.empty()
                 with st.spinner("Thinking..."):
                     reply = ask_gym_bro(
-                        user_input.strip(), st.session_state.gym_bro_messages[:-1], profile, TARGETS)
+                        user_input.strip(), st.session_state.gym_bro_messages[:-1],
+                        profile, TARGETS,
+                        on_progress=lambda msg: status_box.caption(msg))
+                status_box.empty()
                 if reply is None:
                     reply = t("gym_bro_missing_key")
                 st.session_state.gym_bro_messages.append(("assistant", reply))
@@ -4637,14 +4666,39 @@ elif page == t("nav_today"):
                                       f"{log_date_str}_{st.session_state['active_timer']}"
                                       f"_{st.session_state.get('timer_started_for','')}")
 
-        st.markdown("---")
+        # Each exercise sits in its own bordered card. Without this the rows run
+        # together and it's genuinely hard to tell which suggestion or quick-log
+        # row belongs to which movement.
+        st.markdown("""
+        <style>
+        div[data-testid="stVerticalBlockBorderWrapper"]:has(> div > div > div.ex-card-marker) {
+            border: 1px solid rgba(147,163,184,0.16) !important;
+            border-radius: 10px !important;
+            padding: 12px 14px 6px 14px !important;
+            margin-bottom: 14px !important;
+            background: rgba(255,255,255,0.015) !important;
+        }
+        .ex-card-marker { display:none; }
+        </style>
+        """, unsafe_allow_html=True)
 
         for ex in day_plan["exercises"]:
+          with st.container(border=True):
+            st.markdown("<div class='ex-card-marker'></div>", unsafe_allow_html=True)
             swap = get_exercise_swap(log_date_str, ex)
             effective_name = swap if swap else ex
 
-            checkbox_label = effective_name if not swap else f"{effective_name}  🔄"
-            checked = st.checkbox(checkbox_label, value=ex_state[ex], key=f"ex_{log_date_str}_{ex}")
+            # Name as a heading, so each card has one obvious title. The checkbox
+            # keeps its own short label rather than carrying the exercise name.
+            st.markdown(
+                f"<div style='font-family:\"Bricolage Grotesque\",sans-serif;"
+                f"font-weight:700;font-size:1.02rem;letter-spacing:-0.01em;"
+                f"margin:0 0 4px 0;'>{effective_name}"
+                + ("<span style='font-size:0.72rem;opacity:0.6;font-weight:500;'>"
+                   "&nbsp;&nbsp;🔄 swapped</span>" if swap else "")
+                + "</div>", unsafe_allow_html=True)
+            checked = st.checkbox(t("done_label"), value=ex_state[ex],
+                                  key=f"ex_{log_date_str}_{ex}")
             # Checkbox state stays keyed on the ORIGINAL name so streaks, momentum
             # score and perfect-day logic are unaffected by swaps.
             if checked != ex_state[ex]:
@@ -4678,17 +4732,31 @@ elif page == t("nav_today"):
 
             # Coach suggestion: what to aim for today, based on last session.
             suggestion = suggest_next_load(effective_name, before_date=log_date_str)
+            if suggestion:
+                tone = {"progress": ("#10b981", "📈"), "repeat": ("#f59e0b", "🔁"),
+                        "deload": ("#ef4444", "📉"), "start": ("#3b82f6", "▶")}
+                colour, icon = tone.get(suggestion["action"], ("#3b82f6", "▶"))
+                target_txt = (f"{suggestion['weight']:g} kg × {suggestion['reps']}"
+                              if suggestion["weight"] else f"{suggestion['reps']} reps")
+                st.markdown(
+                    f"<div style='border-left:3px solid {colour};padding:6px 10px;"
+                    f"margin:2px 0 8px 0;background:rgba(255,255,255,0.02);border-radius:4px;'>"
+                    f"<span style='font-weight:700;font-size:0.9rem;'>{icon} "
+                    f"{t('suggested_label')}: {target_txt}</span><br>"
+                    f"<span style='font-size:0.78rem;color:#9aa5b1;'>"
+                    f"{suggestion['reason']}</span></div>",
+                    unsafe_allow_html=True)
 
-            # Quick log — add a set without opening the panel. Saves an
-            # interaction per exercise, which adds up over a session.
+            # Quick log — add a set without opening the panel. Rendered LAST so
+            # the action row sits directly above this exercise's detail panel,
+            # not floating between one exercise and the next.
             q_pref = get_exercise_pref(effective_name)
             if q_pref["log_type"] == "weight_reps":
                 today_sets = get_sets(log_date_str, effective_name)
                 seed_w = seed_r = 0.0
-                if today_sets:
-                    donesets = [x for x in today_sets if (x["reps"] or 0) > 0]
-                    if donesets:
-                        seed_w, seed_r = donesets[-1]["weight_kg"], donesets[-1]["reps"]
+                donesets = [x for x in today_sets if (x["reps"] or 0) > 0]
+                if donesets:
+                    seed_w, seed_r = donesets[-1]["weight_kg"], donesets[-1]["reps"]
                 if not seed_w and suggestion and suggestion.get("weight"):
                     seed_w = suggestion["weight"] / (2 if q_pref["per_side"] else 1)
                     seed_r = suggestion["reps"]
@@ -4720,24 +4788,8 @@ elif page == t("nav_today"):
                                 st.rerun()
                             except Exception as e:
                                 st.error(t("db_reconnect_error").format(err=str(e)[:120]))
-                done_count = len([x for x in get_sets(log_date_str, effective_name)
-                                  if (x["reps"] or 0) > 0])
-                if done_count:
-                    st.caption(f"✓ {done_count} {t('sets_done_label')}")
-            if suggestion:
-                tone = {"progress": ("#10b981", "📈"), "repeat": ("#f59e0b", "🔁"),
-                        "deload": ("#ef4444", "📉"), "start": ("#3b82f6", "▶")}
-                colour, icon = tone.get(suggestion["action"], ("#3b82f6", "▶"))
-                target_txt = (f"{suggestion['weight']:g} kg × {suggestion['reps']}"
-                              if suggestion["weight"] else f"{suggestion['reps']} reps")
-                st.markdown(
-                    f"<div style='border-left:3px solid {colour};padding:6px 10px;"
-                    f"margin:2px 0 8px 0;background:rgba(255,255,255,0.02);border-radius:4px;'>"
-                    f"<span style='font-weight:700;font-size:0.9rem;'>{icon} "
-                    f"{t('suggested_label')}: {target_txt}</span><br>"
-                    f"<span style='font-size:0.78rem;color:#9aa5b1;'>"
-                    f"{suggestion['reason']}</span></div>",
-                    unsafe_allow_html=True)
+                if donesets:
+                    st.caption(f"✓ {len(donesets)} {t('sets_done_label')}")
 
             # Everything below is scoped to a fragment: typing a rep count
             # reruns only this block, not the whole page. The checkbox above
