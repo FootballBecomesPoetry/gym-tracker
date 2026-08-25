@@ -133,12 +133,24 @@ _MUSCLE_ALIASES = {
     "hamstrings": "Hamstrings",
     "glutes": "Glutes",
     "calves": "Calves",
+    # Labels used by the exercise library (see exercise_library.json)
+    "upper back": "Back", "forearms": "Biceps",
 }
 
 
 def muscle_regions_for(exercise_name):
-    """Map an exercise to a list of canonical muscle regions (may be empty)."""
+    """Map an exercise to a list of canonical muscle regions (may be empty).
+
+    Falls through to the full exercise library, so a swapped-in movement like
+    "Barbell Squat" is still classified as lower body rather than returning
+    nothing and being treated as an unknown upper-body lift.
+    """
     info = EXERCISE_INFO.get(base_exercise_name(exercise_name))
+    if not info:
+        try:
+            info = find_exercise_info(exercise_name)
+        except Exception:
+            info = None
     if not info:
         return []
     out = []
@@ -664,6 +676,41 @@ BASE_EN = {
     "db_reconnect_error": "Couldn't reach the database just then — the connection had gone "
                           "idle. It's been reset, so tap Add set again and it should work. "
                           "({err})",
+    # --- coaching / quick log ---
+    "repeat_set": "↻ Repeat", "use_suggestion": "✓ Use suggestion",
+    "suggested_label": "Suggested",
+    "quick_log": "Log set", "sets_done_label": "sets logged today",
+    "auto_timer_label": "Auto-start rest timer when a set is logged",
+    "rest_seconds_label": "Rest length (seconds)",
+    # --- insights page ---
+    "nav_insights": "Insights", "insights_header": "🧭 Training Insights",
+    "insights_intro": "What your training data says about the last few weeks.",
+    "muscle_sets_header": "💪 Weekly Sets per Muscle",
+    "muscle_sets_caption": "Roughly {lo}-{hi} hard sets per muscle per week is the commonly "
+                           "cited range for growth. Treat it as a guide rail, not a rule.",
+    "no_sets_this_week": "No sets logged this week yet.",
+    "status_none": "none", "status_low": "low", "status_good": "on track", "status_high": "high",
+    "undertrained_warning": "Under-trained this week: {muscles}. Worth adding a set or two "
+                            "next session if that isn't deliberate.",
+    "stalled_header": "⚠️ Lifts That Have Stalled",
+    "stalled_caption": "No improvement in estimated 1RM over the last 4 weeks:",
+    "stalled_line": "flat across {n} sessions",
+    "current_label": "now", "over_window_label": "over the window",
+    "nothing_stalled": "Nothing looks stalled — every lift with enough data is still moving.",
+    "stalled_advice": "Options: drop the load ~10% and build back, change rep range, swap the "
+                      "variation, or check sleep and food before blaming the programme.",
+    "consistency_header": "📆 Training Consistency",
+    "week_streak_label": "Weeks at 3+", "avg_sessions_label": "Avg sessions/week",
+    "total_sessions_label": "Sessions (8 wks)",
+    "consistency_caption": "Counts days you actually logged a set — not days you opened the app.",
+    "target_3_label": "3/week",
+    "vol_bw_header": "📊 Volume vs Bodyweight",
+    "vol_bw_caption": "Training volume each week against your average bodyweight — shows "
+                      "whether the two are moving together.",
+    "volume_label": "Volume (kg)",
+    "review_header": "📝 This Week's Review", "sessions_label": "Sessions",
+    "prs_label": "New bests", "prs_this_week": "🎉 New bests this week:",
+    "ask_gym_bro_review": "🤖 Ask Gym Bro to review my week",
     "last_time_label": "Last time", "best_ever_label": "Best ever",
     "last_peak_label": "Last session peak",
     "new_pb_label": "New personal best —", "no_history_label": "No history yet for this lift",
@@ -2365,6 +2412,354 @@ def get_strength_trend(exercise):
     df = pd.DataFrame(sorted(per_day.values(), key=lambda r: r["log_date"]))
     df["log_date"] = pd.to_datetime(df["log_date"])
     return df
+
+
+# ---------------------------------------------------------------
+# PROGRESSIVE OVERLOAD / COACHING
+# ---------------------------------------------------------------
+# Simple double-progression rules, deliberately conservative:
+#   - hit every target rep last time  -> add a small increment
+#   - fell short once                 -> repeat the same load
+#   - fell short twice in a row       -> deload ~10% to rebuild
+# Increments differ by movement because a 2.5 kg jump on a lateral raise is a
+# far bigger relative step than on a squat.
+UPPER_INCREMENT_KG = 2.5
+LOWER_INCREMENT_KG = 5.0
+ISOLATION_INCREMENT_KG = 1.25
+DELOAD_FRACTION = 0.90
+
+LOWER_BODY_REGIONS = {"Quads", "Hamstrings", "Glutes", "Calves"}
+ISOLATION_HINTS = ("raise", "fly", "flye", "curl", "pushdown", "extension",
+                   "kickback", "shrug", "calf", "face pull")
+
+
+def load_increment_for(exercise):
+    """How much to add when an exercise is ready to progress."""
+    name = (exercise or "").lower()
+    if any(h in name for h in ISOLATION_HINTS):
+        return ISOLATION_INCREMENT_KG
+    regions = set(muscle_regions_for(exercise))
+    if regions & LOWER_BODY_REGIONS:
+        return LOWER_INCREMENT_KG
+    return UPPER_INCREMENT_KG
+
+
+def target_reps_for(exercise):
+    """Target reps parsed from the plan name, e.g. 'Bench Press 4x6-8' -> 8.
+
+    Uses the top of a range: you progress once you can hit the upper end.
+    Falls back to 8 when the plan doesn't specify.
+    """
+    m = re.search(r"(\d+)\s*x\s*(\d+)(?:\s*-\s*(\d+))?", exercise or "", re.IGNORECASE)
+    if m:
+        return int(m.group(3) or m.group(2))
+    return 8
+
+
+def _session_history(exercise, limit=4):
+    """Recent sessions, newest first: [{date, top_load, top_reps, hit_all}]."""
+    cols, rows = fetch("""SELECT log_date FROM exercise_sets
+                          WHERE user_id=%s AND exercise=%s AND reps > 0
+                          GROUP BY log_date ORDER BY log_date DESC LIMIT %s""",
+                       (current_user_id(), exercise, limit))
+    per_side = get_exercise_pref(exercise)["per_side"]
+    target = target_reps_for(exercise)
+    out = []
+    for (log_date,) in rows:
+        sets = get_sets(log_date, exercise)
+        working = [x for x in sets if (x["reps"] or 0) > 0]
+        if not working:
+            continue
+        loads = [(effective_load(x["weight_kg"], per_side), int(x["reps"])) for x in working]
+        top_load = max(l for l, _ in loads)
+        reps_at_top = [r for l, r in loads if l == top_load]
+        out.append({
+            "date": log_date,
+            "top_load": top_load,
+            "top_reps": max(reps_at_top),
+            # "hit all" means every set at the working load reached target reps
+            "hit_all": all(r >= target for l, r in loads if l >= top_load),
+            "sets": len(working),
+        })
+    return out
+
+
+def suggest_next_load(exercise, before_date=None):
+    """What to aim for next time on this exercise.
+
+    Returns None when there's nothing to go on yet. Otherwise:
+      {action, weight, reps, reason}  with action in
+      {"start", "progress", "repeat", "deload"}
+    """
+    history = _session_history(exercise, limit=3)
+    if before_date:
+        history = [h for h in history if h["date"] < before_date]
+    if not history:
+        return None
+
+    target = target_reps_for(exercise)
+    last = history[0]
+    increment = load_increment_for(exercise)
+
+    # Bodyweight movements progress by reps, not load.
+    if last["top_load"] <= 0:
+        return {"action": "progress", "weight": 0.0, "reps": last["top_reps"] + 1,
+                "reason": f"Bodyweight — last time {last['top_reps']} reps. Try one more."}
+
+    if last["hit_all"]:
+        return {"action": "progress",
+                "weight": last["top_load"] + increment, "reps": target,
+                "reason": (f"You hit {target} reps at {last['top_load']:g} kg last time. "
+                           f"Add {increment:g} kg.")}
+
+    missed_twice = len(history) >= 2 and not history[1]["hit_all"]
+    if missed_twice:
+        deload = round((last["top_load"] * DELOAD_FRACTION) / 2.5) * 2.5
+        return {"action": "deload", "weight": max(deload, increment), "reps": target,
+                "reason": (f"Short of {target} reps two sessions running. "
+                           f"Drop to {deload:g} kg and build back up.")}
+
+    return {"action": "repeat", "weight": last["top_load"], "reps": target,
+            "reason": (f"You managed {last['top_reps']} of {target} reps at "
+                       f"{last['top_load']:g} kg. Stay here until it's clean.")}
+
+
+# ---------------------------------------------------------------
+# WEEKLY SETS PER MUSCLE GROUP
+# ---------------------------------------------------------------
+# Hypertrophy research broadly supports roughly 10-20 hard sets per muscle per
+# week, so those are used as soft guide rails rather than hard targets.
+SETS_PER_MUSCLE_MIN = 10
+SETS_PER_MUSCLE_MAX = 20
+
+
+def get_weekly_sets_per_muscle(start, end):
+    """Working sets per muscle region over a date range.
+
+    A set counts once for every region the exercise trains, which is how set
+    -counting is normally done in programming.
+    """
+    df = get_sets_for_range(start, end)
+    totals = {region: 0 for region in MUSCLE_REGIONS}
+    if df.empty:
+        return totals
+    for _, r in df.iterrows():
+        if int(r["reps"] or 0) <= 0:
+            continue
+        for region in muscle_regions_for(r["exercise"]):
+            totals[region] += 1
+    return totals
+
+
+def muscle_set_status(count):
+    """Bucket a weekly set count against the guide rails."""
+    if count == 0:
+        return "none"
+    if count < SETS_PER_MUSCLE_MIN:
+        return "low"
+    if count > SETS_PER_MUSCLE_MAX:
+        return "high"
+    return "good"
+
+
+# ---------------------------------------------------------------
+# STALLED LIFT DETECTION
+# ---------------------------------------------------------------
+def find_stalled_lifts(weeks=4, min_sessions=3):
+    """Lifts whose best estimated 1RM hasn't improved in `weeks`.
+
+    Only considers lifts trained at least `min_sessions` times in that window,
+    so a lift you did once isn't flagged as stalled.
+    """
+    cutoff = (date.today() - timedelta(weeks=weeks)).isoformat()
+    stalled = []
+    for exercise in get_logged_exercise_names():
+        trend = get_strength_trend(exercise)
+        if trend.empty or len(trend) < min_sessions:
+            continue
+        recent = trend[trend["log_date"] >= pd.Timestamp(cutoff)]
+        if len(recent) < min_sessions:
+            continue
+        best_recent = recent["e1rm"].max()
+        best_ever = trend["e1rm"].max()
+        # Stalled if nothing in the window beat the all-time best, and the
+        # window's own trend is flat or negative.
+        first, last = recent["e1rm"].iloc[0], recent["e1rm"].iloc[-1]
+        if best_recent < best_ever - 0.01 or last <= first + 0.01:
+            stalled.append({
+                "exercise": exercise,
+                "sessions": len(recent),
+                "current": float(last),
+                "best": float(best_ever),
+                "change": float(last - first),
+            })
+    return sorted(stalled, key=lambda r: r["change"])
+
+
+# ---------------------------------------------------------------
+# TRAINING CONSISTENCY (distinct from the logging streak)
+# ---------------------------------------------------------------
+def get_training_days(start, end):
+    """Dates in range with at least one completed set — actual training, not
+    just an app visit."""
+    cols, rows = fetch("""SELECT DISTINCT log_date FROM exercise_sets
+                          WHERE user_id=%s AND log_date BETWEEN %s AND %s
+                          AND (reps > 0 OR duration_min > 0)""",
+                       (current_user_id(), start.isoformat(), end.isoformat()))
+    return sorted(r[0] for r in rows)
+
+
+def compute_training_consistency(weeks=8):
+    """Sessions per week and the current run of weeks meeting a 3-session bar."""
+    end = date.today()
+    start = end - timedelta(weeks=weeks)
+    days = set(get_training_days(start, end))
+    per_week = []
+    for w in range(weeks):
+        wk_start = end - timedelta(days=end.weekday()) - timedelta(weeks=w)
+        wk_end = wk_start + timedelta(days=6)
+        count = sum(1 for d in days
+                    if wk_start.isoformat() <= d <= wk_end.isoformat())
+        per_week.append({"week_start": wk_start, "sessions": count})
+    per_week.reverse()
+
+    # Current run of consecutive weeks with 3+ sessions, ignoring this week if
+    # it's still in progress and short.
+    streak = 0
+    for entry in reversed(per_week):
+        if entry["sessions"] >= 3:
+            streak += 1
+        elif entry is per_week[-1]:
+            continue  # this week may not be finished yet
+        else:
+            break
+    total = sum(e["sessions"] for e in per_week)
+    return {"per_week": per_week, "week_streak": streak,
+            "total_sessions": total, "avg_per_week": total / max(weeks, 1)}
+
+
+def build_review_prompt(review, consistency):
+    """Turn the week's numbers into a prompt Gym Bro can comment on.
+
+    Facts are assembled here rather than letting the model query freely, so the
+    review is grounded in real figures and can't invent a session.
+    """
+    trained = ", ".join(f"{m} {c}" for m, c in review["muscle_sets"].items() if c > 0)
+    lines = [
+        f"Week of {review['week_start'].strftime('%d %b')} "
+        f"to {review['week_end'].strftime('%d %b %Y')}.",
+        f"Sessions trained: {review['sessions']}.",
+        f"Total volume: {review['volume_kg']:,.0f} kg "
+        f"(previous week {review['prev_volume_kg']:,.0f} kg).",
+        "Sets per muscle: " + (trained or "none logged"),
+    ]
+    if review["undertrained"]:
+        lines.append("Under 10 sets this week: " + ", ".join(review["undertrained"]) + ".")
+    if review["prs"]:
+        lines.append("New bests: " + ", ".join(
+            f"{p['exercise']} {p['weight']:g} kg (was {p['previous']:g} kg)"
+            for p in review["prs"]) + ".")
+    if review["stalled"]:
+        lines.append("Not progressing: " + ", ".join(
+            f"{x['exercise']} ({x['change']:+.1f} kg est 1RM)"
+            for x in review["stalled"][:5]) + ".")
+    lines.append(f"Weeks in a row with 3+ sessions: {consistency['week_streak']}. "
+                 f"Average sessions per week over 8 weeks: "
+                 f"{consistency['avg_per_week']:.1f}.")
+
+    return (
+        "Here is my training data for the past week. Write a short weekly review: "
+        "two or three sentences on what went well, then two or three specific, "
+        "actionable things to focus on next week. Be direct and concrete, reference "
+        "the actual numbers, and don't pad it with encouragement. Do not invent any "
+        "data beyond what I've given you.\n\n" + "\n".join(lines)
+    )
+
+
+def get_volume_vs_bodyweight(weeks=12):
+    """Weekly training volume alongside average bodyweight.
+
+    Overlaying the two answers "am I gaining while training more, or drifting?",
+    which neither chart shows on its own.
+    """
+    end = date.today()
+    start = end - timedelta(weeks=weeks)
+    sets_df = get_sets_for_range(start, end)
+    weight_df = get_range_df(start, end).dropna(subset=["weight_kg"])
+
+    rows = []
+    for w in range(weeks):
+        wk_start = end - timedelta(days=end.weekday()) - timedelta(weeks=w)
+        wk_end = wk_start + timedelta(days=6)
+        lo, hi = wk_start.isoformat(), wk_end.isoformat()
+
+        volume = 0.0
+        if not sets_df.empty:
+            chunk = sets_df[(sets_df["log_date"] >= lo) & (sets_df["log_date"] <= hi)]
+            per_side_cache = {}
+            for _, r in chunk.iterrows():
+                ex = r["exercise"]
+                if ex not in per_side_cache:
+                    per_side_cache[ex] = get_exercise_pref(ex)["per_side"]
+                volume += effective_load(r["weight_kg"], per_side_cache[ex]) * int(r["reps"] or 0)
+
+        bw = None
+        if not weight_df.empty:
+            wchunk = weight_df[(weight_df["log_date"] >= lo) & (weight_df["log_date"] <= hi)]
+            if not wchunk.empty:
+                bw = float(wchunk["weight_kg"].mean())
+
+        rows.append({"week_start": wk_start, "volume_kg": volume, "bodyweight_kg": bw})
+
+    rows.reverse()
+    return pd.DataFrame(rows)
+
+
+def build_weekly_review(week_offset=0):
+    """Everything needed for the weekly review, gathered in one place."""
+    today = date.today()
+    wk_start = today - timedelta(days=today.weekday()) - timedelta(weeks=week_offset)
+    wk_end = wk_start + timedelta(days=6)
+
+    training_days = get_training_days(wk_start, wk_end)
+    muscle_sets = get_weekly_sets_per_muscle(wk_start, wk_end)
+    volume = get_total_volume_for_range(wk_start, wk_end)
+
+    prev_start = wk_start - timedelta(weeks=1)
+    prev_volume = get_total_volume_for_range(prev_start, prev_start + timedelta(days=6))
+
+    # PRs set during the week
+    cols, rows = fetch("""SELECT DISTINCT exercise FROM exercise_sets
+                          WHERE user_id=%s AND log_date BETWEEN %s AND %s
+                          AND weight_kg > 0 AND reps > 0""",
+                       (current_user_id(), wk_start.isoformat(), wk_end.isoformat()))
+    prs = []
+    for (exercise,) in rows:
+        before = get_best_ever(exercise, before_date=wk_start.isoformat())
+        during = None
+        for d in training_days:
+            per_side = get_exercise_pref(exercise)["per_side"]
+            for x in get_sets(d, exercise):
+                load = effective_load(x["weight_kg"], per_side)
+                if load > 0 and (x["reps"] or 0) > 0:
+                    if during is None or load > during:
+                        during = load
+        if during and (before is None or during > before["top_weight"]):
+            prs.append({"exercise": exercise, "weight": during,
+                        "previous": before["top_weight"] if before else 0})
+
+    return {
+        "week_start": wk_start, "week_end": wk_end,
+        "sessions": len(training_days), "training_days": training_days,
+        "volume_kg": volume, "prev_volume_kg": prev_volume,
+        "volume_change_pct": ((volume - prev_volume) / prev_volume * 100)
+                             if prev_volume else None,
+        "muscle_sets": muscle_sets,
+        "undertrained": [m for m, c in muscle_sets.items()
+                         if muscle_set_status(c) in ("none", "low")],
+        "prs": prs,
+        "stalled": find_stalled_lifts(),
+    }
 
 
 def get_muscle_volume_for_range(start, end):
@@ -4079,7 +4474,8 @@ with st.sidebar:
     page = st.radio(
         t("app_title"),
         [t("nav_home"), t("nav_today"), t("nav_weight_log"), t("nav_weekly_dashboard"),
-         t("nav_measurements"), t("nav_photos"), t("nav_achievements"), t("nav_plan"),
+         t("nav_measurements"), t("nav_photos"), t("nav_insights"),
+         t("nav_achievements"), t("nav_plan"),
          t("nav_profile"), t("nav_settings")],
         label_visibility="collapsed"
     )
@@ -4232,9 +4628,14 @@ elif page == t("nav_today"):
                         if st.button(f"{secs//60}:{secs%60:02d}", key=f"rt_{log_date_str}_{secs}",
                                      width="stretch"):
                             st.session_state["active_timer"] = secs
+                            st.session_state["rest_seconds"] = secs
+                st.checkbox(t("auto_timer_label"),
+                            value=st.session_state.get("auto_rest_timer", True),
+                            key="auto_rest_timer")
                 if st.session_state.get("active_timer"):
                     render_rest_timer(st.session_state["active_timer"],
-                                      f"{log_date_str}_{st.session_state['active_timer']}")
+                                      f"{log_date_str}_{st.session_state['active_timer']}"
+                                      f"_{st.session_state.get('timer_started_for','')}")
 
         st.markdown("---")
 
@@ -4274,6 +4675,69 @@ elif page == t("nav_today"):
                     f"<div style='font-size:0.82rem;color:#9aa5b1;margin:-6px 0 6px 0;'>"
                     + "&nbsp;&nbsp;·&nbsp;&nbsp;".join(peak_bits).replace("**", "")
                     + "</div>", unsafe_allow_html=True)
+
+            # Coach suggestion: what to aim for today, based on last session.
+            suggestion = suggest_next_load(effective_name, before_date=log_date_str)
+
+            # Quick log — add a set without opening the panel. Saves an
+            # interaction per exercise, which adds up over a session.
+            q_pref = get_exercise_pref(effective_name)
+            if q_pref["log_type"] == "weight_reps":
+                today_sets = get_sets(log_date_str, effective_name)
+                seed_w = seed_r = 0.0
+                if today_sets:
+                    donesets = [x for x in today_sets if (x["reps"] or 0) > 0]
+                    if donesets:
+                        seed_w, seed_r = donesets[-1]["weight_kg"], donesets[-1]["reps"]
+                if not seed_w and suggestion and suggestion.get("weight"):
+                    seed_w = suggestion["weight"] / (2 if q_pref["per_side"] else 1)
+                    seed_r = suggestion["reps"]
+
+                qc1, qc2, qc3 = st.columns([2, 2, 2])
+                with qc1:
+                    qw = st.number_input(
+                        t("weight_each_label") if q_pref["per_side"] else t("weight_kg_label"),
+                        min_value=0.0, step=2.5, value=float(seed_w),
+                        key=f"qw_{log_date_str}_{ex}", label_visibility="collapsed")
+                with qc2:
+                    qr = st.number_input(
+                        t("reps_label"), min_value=0, step=1, value=int(seed_r),
+                        key=f"qr_{log_date_str}_{ex}", label_visibility="collapsed")
+                with qc3:
+                    if st.button(t("quick_log"), key=f"ql_{log_date_str}_{ex}",
+                                 width="stretch", type="primary"):
+                        if qr > 0:
+                            try:
+                                save_set(log_date_str, effective_name,
+                                         next_set_number(log_date_str, effective_name),
+                                         qr, qw)
+                                if not ex_state[ex]:
+                                    set_exercise_check(log_date_str, ex, True)
+                                if st.session_state.get("auto_rest_timer", True):
+                                    st.session_state["active_timer"] = \
+                                        st.session_state.get("rest_seconds", 90)
+                                    st.session_state["timer_started_for"] = f"q{ex}"
+                                st.rerun()
+                            except Exception as e:
+                                st.error(t("db_reconnect_error").format(err=str(e)[:120]))
+                done_count = len([x for x in get_sets(log_date_str, effective_name)
+                                  if (x["reps"] or 0) > 0])
+                if done_count:
+                    st.caption(f"✓ {done_count} {t('sets_done_label')}")
+            if suggestion:
+                tone = {"progress": ("#10b981", "📈"), "repeat": ("#f59e0b", "🔁"),
+                        "deload": ("#ef4444", "📉"), "start": ("#3b82f6", "▶")}
+                colour, icon = tone.get(suggestion["action"], ("#3b82f6", "▶"))
+                target_txt = (f"{suggestion['weight']:g} kg × {suggestion['reps']}"
+                              if suggestion["weight"] else f"{suggestion['reps']} reps")
+                st.markdown(
+                    f"<div style='border-left:3px solid {colour};padding:6px 10px;"
+                    f"margin:2px 0 8px 0;background:rgba(255,255,255,0.02);border-radius:4px;'>"
+                    f"<span style='font-weight:700;font-size:0.9rem;'>{icon} "
+                    f"{t('suggested_label')}: {target_txt}</span><br>"
+                    f"<span style='font-size:0.78rem;color:#9aa5b1;'>"
+                    f"{suggestion['reason']}</span></div>",
+                    unsafe_allow_html=True)
 
             # Everything below is scoped to a fragment: typing a rep count
             # reruns only this block, not the whole page. The checkbox above
@@ -4388,8 +4852,36 @@ elif page == t("nav_today"):
                                                   value=int(sset["reps"] or 0), key=f"r_{kbase}")
                           if (w, r) != (sset["weight_kg"], sset["reps"]):
                               save_set(log_date_str, effective_name, n, r, w)
+                              # Logging a completed set starts the rest clock, so
+                              # you don't have to reach for it with chalky hands.
+                              if r > 0 and st.session_state.get("auto_rest_timer", True):
+                                  st.session_state["active_timer"] = st.session_state.get(
+                                      "rest_seconds", 90)
+                                  st.session_state["timer_started_for"] = f"{kbase}"
                           if per_side and w:
                               st.caption(f"= {effective_load(w, True):g} kg total")
+
+                          # One tap to copy the previous set, or the suggestion on
+                          # an empty first set. Typing the same numbers four times
+                          # is the single most repetitive part of logging.
+                          if (w, r) == (0, 0):
+                              prior = next((x for x in reversed(sets)
+                                            if x["set_number"] < n and (x["reps"] or 0) > 0), None)
+                              if prior:
+                                  if st.button(
+                                          f"{t('repeat_set')} — {prior['weight_kg']:g} kg × {prior['reps']}",
+                                          key=f"rep_{kbase}", width="stretch"):
+                                      save_set(log_date_str, effective_name, n,
+                                               prior["reps"], prior["weight_kg"])
+                                      st.rerun()
+                              elif suggestion and suggestion.get("weight"):
+                                  sug_w = suggestion["weight"] / (2 if per_side else 1)
+                                  if st.button(
+                                          f"{t('use_suggestion')} — {sug_w:g} kg × {suggestion['reps']}",
+                                          key=f"sug_{kbase}", width="stretch"):
+                                      save_set(log_date_str, effective_name, n,
+                                               suggestion["reps"], sug_w)
+                                      st.rerun()
 
                   ac1, ac2 = st.columns(2)
                   with ac1:
@@ -4948,6 +5440,141 @@ elif page == t("nav_photos"):
                 if st.button(t("delete_label"), key=f"del_photo_{p['id']}"):
                     delete_photo(p["id"])
                     st.rerun()
+
+elif page == t("nav_insights"):
+    st.subheader(t("insights_header"))
+    st.caption(t("insights_intro"))
+
+    today = local_today()
+    wk_start = today - timedelta(days=today.weekday())
+    wk_end = wk_start + timedelta(days=6)
+
+    # ---------- Weekly sets per muscle ----------
+    st.markdown(f"#### {t('muscle_sets_header')}")
+    st.caption(t("muscle_sets_caption").format(lo=SETS_PER_MUSCLE_MIN, hi=SETS_PER_MUSCLE_MAX))
+    sets_by_muscle = get_weekly_sets_per_muscle(wk_start, wk_end)
+    if sum(sets_by_muscle.values()) == 0:
+        st.info(t("no_sets_this_week"))
+    else:
+        status_style = {
+            "none": ("#6b7280", t("status_none")),
+            "low": ("#f59e0b", t("status_low")),
+            "good": ("#10b981", t("status_good")),
+            "high": ("#3b82f6", t("status_high")),
+        }
+        for region in MUSCLE_REGIONS:
+            count = sets_by_muscle.get(region, 0)
+            colour, label = status_style[muscle_set_status(count)]
+            pct = min(count / SETS_PER_MUSCLE_MAX, 1.0)
+            st.markdown(
+                f"<div style='display:flex;align-items:center;gap:8px;font-size:0.85rem;"
+                f"margin-bottom:2px;'>"
+                f"<span style='min-width:88px;'>{region}</span>"
+                f"<span style='flex:1;height:7px;background:rgba(147,163,184,0.18);"
+                f"border-radius:4px;overflow:hidden;'>"
+                f"<span style='display:block;height:100%;width:{pct*100:.0f}%;"
+                f"background:{colour};border-radius:4px;'></span></span>"
+                f"<span style='min-width:52px;text-align:right;font-weight:700;'>{count}</span>"
+                f"<span style='min-width:64px;font-size:0.72rem;color:{colour};'>{label}</span>"
+                f"</div>", unsafe_allow_html=True)
+
+        low = [m for m, c in sets_by_muscle.items() if muscle_set_status(c) in ("none", "low")]
+        if low:
+            st.warning(t("undertrained_warning").format(muscles=", ".join(low)))
+
+    st.markdown("---")
+
+    # ---------- Stalled lifts ----------
+    st.markdown(f"#### {t('stalled_header')}")
+    stalled = find_stalled_lifts()
+    if not stalled:
+        st.success(t("nothing_stalled"))
+    else:
+        st.caption(t("stalled_caption"))
+        for item in stalled[:8]:
+            st.markdown(
+                f"**{item['exercise']}** — {t('stalled_line').format(n=item['sessions'])}  \n"
+                f"<span style='font-size:0.8rem;color:#9aa5b1;'>"
+                f"{t('current_label')} {item['current']:.1f} kg · "
+                f"{t('best_ever_label')} {item['best']:.1f} kg · "
+                f"{item['change']:+.1f} kg {t('over_window_label')}</span>",
+                unsafe_allow_html=True)
+        st.info(t("stalled_advice"))
+
+    st.markdown("---")
+
+    # ---------- Training consistency ----------
+    st.markdown(f"#### {t('consistency_header')}")
+    consistency = compute_training_consistency()
+    c1, c2, c3 = st.columns(3)
+    c1.metric(t("week_streak_label"), f"{consistency['week_streak']} 🔥")
+    c2.metric(t("avg_sessions_label"), f"{consistency['avg_per_week']:.1f}")
+    c3.metric(t("total_sessions_label"), consistency["total_sessions"])
+    st.caption(t("consistency_caption"))
+
+    cons_df = pd.DataFrame([
+        {"Week": e["week_start"].strftime("%d %b"), "Sessions": e["sessions"]}
+        for e in consistency["per_week"]])
+    fig_c = px.bar(cons_df, x="Week", y="Sessions", title=None)
+    fig_c.add_hline(y=3, line_dash="dash", line_color="#10b981",
+                    annotation_text=t("target_3_label"))
+    fig_c.update_layout(height=240, margin=dict(t=10, b=10), xaxis_title="")
+    st.plotly_chart(fig_c, width="stretch")
+
+    st.markdown("---")
+
+    # ---------- Volume vs bodyweight ----------
+    st.markdown(f"#### {t('vol_bw_header')}")
+    st.caption(t("vol_bw_caption"))
+    vb = get_volume_vs_bodyweight()
+    if vb.empty or vb["volume_kg"].sum() == 0:
+        st.info(t("no_volume_yet"))
+    else:
+        vb_plot = vb.copy()
+        vb_plot["Week"] = vb_plot["week_start"].apply(lambda d: d.strftime("%d %b"))
+        fig_v = px.bar(vb_plot, x="Week", y="volume_kg", title=None)
+        fig_v.update_traces(name=t("volume_label"), marker_color="#3b82f6")
+        if vb_plot["bodyweight_kg"].notna().any():
+            fig_v.add_scatter(x=vb_plot["Week"], y=vb_plot["bodyweight_kg"],
+                              mode="lines+markers", name=t("weight_label"),
+                              yaxis="y2", line=dict(color="#E8112D", width=2))
+            fig_v.update_layout(
+                yaxis2=dict(title=t("weight_label"), overlaying="y", side="right",
+                            showgrid=False))
+        fig_v.update_layout(height=300, margin=dict(t=10, b=10),
+                            xaxis_title="", yaxis_title=t("volume_label"),
+                            legend=dict(orientation="h", y=1.12))
+        st.plotly_chart(fig_v, width="stretch")
+
+    st.markdown("---")
+
+    # ---------- Weekly review ----------
+    st.markdown(f"#### {t('review_header')}")
+    review = build_weekly_review()
+    r1, r2, r3 = st.columns(3)
+    r1.metric(t("sessions_label"), review["sessions"])
+    r2.metric(t("volume_label"), f"{review['volume_kg']:,.0f} kg",
+              delta=(f"{review['volume_change_pct']:+.0f}%"
+                     if review["volume_change_pct"] is not None else None))
+    r3.metric(t("prs_label"), len(review["prs"]))
+
+    if review["prs"]:
+        st.success(t("prs_this_week") + " " + ", ".join(
+            f"{p['exercise']} {p['weight']:g} kg" for p in review["prs"][:5]))
+    if review["undertrained"]:
+        st.caption(t("undertrained_warning").format(
+            muscles=", ".join(review["undertrained"])))
+
+    if st.button(t("ask_gym_bro_review"), key="review_btn", type="primary",
+                 width="stretch"):
+        with st.spinner("..."):
+            st.session_state["gym_bro_messages"] = st.session_state.get(
+                "gym_bro_messages", [])
+            prompt = build_review_prompt(review, consistency)
+            reply = ask_gym_bro(prompt, [], get_profile(), TARGETS)
+            st.session_state["weekly_review_text"] = reply or t("gym_bro_missing_key")
+    if st.session_state.get("weekly_review_text"):
+        st.markdown(st.session_state["weekly_review_text"])
 
 elif page == t("nav_achievements"):
     st.subheader(t("achievements_header"))
