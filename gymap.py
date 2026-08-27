@@ -598,7 +598,10 @@ BASE_EN = {
     "notes_label": "Notes (optional)", "save_button": "💾 Save today's log", "saved_msg": "Saved!",
     "prev_day": "⬅ Prev day", "next_day": "Next day ➡", "done_label": "Done",
     "what_did_you_have": "What did you have?", "calories_label": "Calories", "protein_label": "Protein (g)",
-    "use_meal_total": "Use meal total", "water_label": "Water (L)", "steps_label": "Steps",
+    "use_meal_total": "Use meal total",
+    "use_meal_total_help": "Adds up the protein you entered against each meal today "
+                           "and puts the total in the box above.",
+    "no_meal_protein": "Add protein to your meals on the Meals tab to use this.", "water_label": "Water (L)", "steps_label": "Steps",
     "weight_label": "Weight (kg)", "weight_trend_header": "⚖️ Weight Trend",
     "no_weight_entries": "No weigh-ins yet. Add one on the Today page under Numbers, and a trend line appears here once you have a few.",
     "latest_weight": "Latest weight", "change_period": "Change (period)", "entries_logged": "Entries logged",
@@ -649,6 +652,7 @@ BASE_EN = {
     "gym_bro_disclaimer": "Gym Bro gives general fitness/nutrition info, not medical advice. For injuries, pain, or health conditions, see a doctor.",
     "gym_bro_missing_key": "Gym Bro needs a free Gemini API key to work. Add it in your secrets.toml — see the setup notes.",
     "exercise_info_label": "ℹ️ How to do it",
+    "edit_sets_label": "✏️ Sets & settings",
     "muscles_targeted_label": "Muscles targeted",
     "form_cues_label": "Form cues",
     "no_info_label": "No demo added yet for this exercise — fill in EXERCISE_INFO to add one.",
@@ -1346,6 +1350,18 @@ def set_meal_check(log_date, meal, done):
     run("""INSERT INTO meal_checks (user_id, log_date, meal, done) VALUES (%s, %s, %s, %s)
            ON CONFLICT (user_id, log_date, meal) DO UPDATE SET done=excluded.done""",
         (current_user_id(), log_date, meal, int(done)))
+
+def apply_meal_protein_total(widget_key, log_date):
+    """Copy the summed per-meal protein into the daily protein input.
+
+    Runs as a button on_click callback, which Streamlit executes BEFORE the
+    script reruns and rebuilds its widgets. Writing to a widget's session key
+    from the main script body after that widget already exists raises
+    StreamlitAPIException, which is exactly what this avoids.
+    """
+    details = get_meal_details(log_date)
+    st.session_state[widget_key] = float(sum(d["protein_g"] or 0 for d in details.values()))
+
 
 def get_meal_details(log_date):
     cols, rows = fetch(
@@ -2484,6 +2500,20 @@ def _session_history(exercise, limit=4):
     return out
 
 
+def round_to_loadable(kg, per_side=False):
+    """Round a suggested weight to something you can actually load.
+
+    Barbell/machine work rounds to 2.5 kg; per-hand dumbbells round to 1 kg per
+    hand (2 kg total) since gyms rarely stock finer increments. Without this you
+    get suggestions like "22.7 kg", which nobody can put on a bar.
+    """
+    if kg <= 0:
+        return 0.0
+    step = 2.0 if per_side else 2.5
+    rounded = round(kg / step) * step
+    return max(rounded, step)
+
+
 def suggest_next_load(exercise, before_date=None):
     """What to aim for next time on this exercise.
 
@@ -2506,15 +2536,18 @@ def suggest_next_load(exercise, before_date=None):
         return {"action": "progress", "weight": 0.0, "reps": last["top_reps"] + 1,
                 "reason": f"Bodyweight — last time {last['top_reps']} reps. Try one more."}
 
+    per_side = get_exercise_pref(exercise)["per_side"]
+
     if last["hit_all"]:
+        raised = round_to_loadable(last["top_load"] + increment, per_side)
         return {"action": "progress",
-                "weight": last["top_load"] + increment, "reps": target,
+                "weight": raised, "reps": target,
                 "reason": (f"You hit {target} reps at {last['top_load']:g} kg last time. "
-                           f"Add {increment:g} kg.")}
+                           f"Go for {raised:g} kg.")}
 
     missed_twice = len(history) >= 2 and not history[1]["hit_all"]
     if missed_twice:
-        deload = round((last["top_load"] * DELOAD_FRACTION) / 2.5) * 2.5
+        deload = round_to_loadable(last["top_load"] * DELOAD_FRACTION, per_side)
         return {"action": "deload", "weight": max(deload, increment), "reps": target,
                 "reason": (f"Short of {target} reps two sessions running. "
                            f"Drop to {deload:g} kg and build back up.")}
@@ -3424,17 +3457,50 @@ def render_gym_bro_widget():
         z-index: 999999 !important;
         width: auto !important;
     }
-    div.st-key-gym_bro_float > div > div > button {
+    /* Descendant selector, not a fixed child chain: Streamlit wraps popover
+       triggers in a different number of divs from plain buttons, so the old
+       "> div > div > button" path silently missed and left it tiny. */
+    div.st-key-gym_bro_float button {
         border-radius: 50% !important;
-        width: 64px !important;
-        height: 64px !important;
-        min-width: 64px !important;
+        width: 68px !important;
+        height: 68px !important;
+        min-width: 68px !important;
+        min-height: 68px !important;
         padding: 0 !important;
-        font-size: 1.8rem !important;
+        font-size: 2rem !important;
+        line-height: 1 !important;
         background: linear-gradient(135deg, #3b82f6, #8b5cf6) !important;
         color: white !important;
-        border: 2px solid rgba(255,255,255,0.3) !important;
+        border: 2px solid rgba(255,255,255,0.35) !important;
+        box-shadow: 0 6px 20px rgba(0,0,0,0.45) !important;
         animation: gymBroPulse 2.5s ease-in-out infinite;
+        display: flex !important;
+        align-items: center !important;
+        justify-content: center !important;
+    }
+    /* The emoji sits in a nested <p> that inherits a small size otherwise. */
+    div.st-key-gym_bro_float button p,
+    div.st-key-gym_bro_float button div {
+        font-size: 2rem !important;
+        line-height: 1 !important;
+        margin: 0 !important;
+    }
+    div.st-key-gym_bro_float button:hover {
+        transform: scale(1.06);
+        transition: transform 0.15s ease;
+    }
+    /* Keep it clear of iOS home-indicator area on phones. */
+    @media (max-width: 640px) {
+        div.st-key-gym_bro_float {
+            bottom: 22px !important;
+            right: 18px !important;
+        }
+        div.st-key-gym_bro_float button {
+            width: 62px !important;
+            height: 62px !important;
+            min-width: 62px !important;
+            min-height: 62px !important;
+        }
     }
     </style>
     """, unsafe_allow_html=True)
@@ -4804,7 +4870,7 @@ elif page == t("nav_today"):
             @st.fragment
             def _exercise_detail(ex=ex, effective_name=effective_name,
                                  swap=swap, log_date_str=log_date_str):
-              with st.expander(f"{t('exercise_info_label')} — {effective_name}", expanded=False):
+              with st.expander(f"{t('edit_sets_label')} — {effective_name}", expanded=False):
                   info = find_exercise_info(effective_name)
 
                   if swap:
@@ -5007,12 +5073,9 @@ elif page == t("nav_today"):
                       set_exercise_note(log_date_str, effective_name, note)
 
                   st.markdown("---")
-                  # ---------------- DEMO / FORM ----------------
-                  if info:
-                      render_exercise_demo(info, effective_name)
-                  else:
-                      st.caption(t("no_demo_for_swap") if swap else t("no_info_label"))
-
+                  # The demo used to sit here, under all the logging controls, which
+                  # made an expander labelled "How to do it" mostly number inputs.
+                  # It now has its own expander below the card.
                   st.markdown(f"**{t('swap_label')}**")
                   st.caption(t("swap_help"))
                   # Picking from the known list means the swapped exercise still
@@ -5064,6 +5127,16 @@ elif page == t("nav_today"):
                           st.rerun()
 
             _exercise_detail()
+
+            # Demo, target muscles and form cues — its own expander, so the label
+            # matches what's inside it.
+            demo_info = find_exercise_info(effective_name)
+            with st.expander(f"{t('exercise_info_label')} — {effective_name}",
+                             expanded=False):
+                if demo_info:
+                    render_exercise_demo(demo_info, effective_name)
+                else:
+                    st.caption(t("no_demo_for_swap") if swap else t("no_info_label"))
 
         # ---- Extra exercises (anything beyond today's plan) ----
         st.markdown(f"##### {t('extra_exercises_header')}")
@@ -5164,16 +5237,19 @@ elif page == t("nav_today"):
                 f"{t('protein_label')} — target {TARGETS['protein_min']:.0f}-{TARGETS['protein_max']:.0f}g",
                 min_value=0.0, value=float(row["protein_g"] or 0), step=5.0,
                 key=f"protein_{log_date_str}")
-            if st.button(t("use_meal_total"), key=f"use_meal_protein_{log_date_str}"):
-                # Assigning to `protein` here did nothing: the click triggers a
-                # rerun, so the save button never fires on this pass and the
-                # number_input re-renders from its own widget state. Write into
-                # the widget's session key instead, then rerun. Read the total
-                # straight from the DB so it doesn't depend on tab render order.
-                _md = get_meal_details(log_date_str)
-                st.session_state[f"protein_{log_date_str}"] = float(
-                    sum(d["protein_g"] for d in _md.values()))
-                st.rerun()
+            # Total read from the DB, so it doesn't depend on the Meals tab
+            # having been rendered first.
+            _meal_protein = sum((d["protein_g"] or 0)
+                                for d in get_meal_details(log_date_str).values())
+            st.button(
+                f"{t('use_meal_total')} ({_meal_protein:.0f}g)",
+                key=f"use_meal_protein_{log_date_str}",
+                disabled=(_meal_protein <= 0),
+                help=t("use_meal_total_help"),
+                on_click=apply_meal_protein_total,
+                args=(f"protein_{log_date_str}", log_date_str))
+            if _meal_protein <= 0:
+                st.caption(t("no_meal_protein"))
         with n2:
             water = st.number_input(
                 f"{t('water_label')} — target {TARGETS['water_min']}-{TARGETS['water_max']}L",
